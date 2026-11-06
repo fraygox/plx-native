@@ -18,7 +18,7 @@ pub mod abr; // client-managed fixed-session HLS controller: estimate, propose, 
 pub mod aq;
 pub mod curlio; // the HTTPS media plane: a remote file pulled by byte range over libcurl-multi (stream.rs is the plaintext-socket twin)
 pub mod ff_pcm; // FLAC decoded in the app and fed as PCM (libpf has no FLAC input)
-pub mod ff_pcm_pipeline; // PcmDecoder::decode off the demux thread: a one-deep submit/collect worker, same AuBatcher/aq_push_gated call on the demux side
+pub mod ff_pcm_pipeline; // PcmDecoder::decode off the demux thread: one decode in flight (`exchange`), same AuBatcher/aq_push_gated call on the demux side
 #[macro_use]
 pub mod ff; // THE demuxer -- the FFmpeg 9.0 this app BUNDLES and pins (majors 63/63/61), dlopen'd by absolute path beside the binary, never the television's
 pub mod hls; // strict parser/auth/timeline for the measured one-variant PMS HLS shape
