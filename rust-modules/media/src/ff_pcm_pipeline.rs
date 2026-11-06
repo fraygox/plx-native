@@ -1,15 +1,17 @@
-//! A one-deep pipeline around [`crate::ff_pcm::PcmDecoder::decode`], so the demux thread's
-//! `avcodec_send_packet`/`avcodec_receive_frame` work for a software-decoded audio track (DTS,
-//! TrueHD, FLAC, ALAC, LPCM — `devcaps::APP_DECODED`) runs on its own thread instead of
-//! serialized with container parsing and the network read that feeds it.
+//! A one-deep pipeline around [`crate::ff_pcm::PcmDecoder::decode`], so the decode of an
+//! app-decoded audio track (the codecs of `devcaps::APP_DECODED`: the FFmpeg
+//! `avcodec_send_packet`/`avcodec_receive_frame` work and the `PcmConverter` downmix and resample
+//! after it) runs on its own thread instead of serialized with container parsing and the network
+//! read that feeds it.
 //!
 //! **What moves, and what does not.** Only the decode CALL runs on the worker. `ff.rs`'s demux
 //! loop keeps the rest of its audio-push logic where it was: `AuBatcher` batching,
-//! `audio_push_gate`'s cross-lane headroom check, `drain_wire` backpressure, and a decode
-//! failure's fatal break. The worker makes no pushes. It is handed a [`ClonedPacket`] (an
-//! `av_packet_clone`: the demuxer's own `pkt` is reused by the next `av_read_frame` as soon as the
-//! arm returns, so the worker cannot borrow it) and hands back an owned `Vec<u8>`, which the demux
-//! thread puts through the same `AuBatcher` and the same `aq_push_gated` call as before.
+//! `audio_push_gate`'s cross-lane headroom check, `drain_wire` backpressure, the pre-audio headroom
+//! marks, and a decode failure's fatal break. The worker makes no pushes. It is handed a
+//! [`ClonedPacket`] (an `av_packet_clone`: the demuxer's own `pkt` is reused by the next
+//! `av_read_frame` as soon as the arm returns, so the worker cannot borrow it) and hands back an
+//! owned `Vec<u8>`, which the demux thread puts through the same `AuBatcher` and the same
+//! `aq_push_gated` call as before.
 //!
 //! **One decode in flight, by construction.** The demux thread's only way to hand the worker a
 //! packet is [`PcmPipeline::exchange`]: it first collects the decode already in flight (waiting
@@ -17,13 +19,17 @@
 //! one decode is ever outstanding, results come back in the order the packets were read (which
 //! `PcmDecoder`'s `ErrorBudget`, a consecutive-failure counter, relies on), and no call sequence
 //! can queue a second one behind the first. Decode N overlaps everything the demux thread does
-//! until the next audio packet arrives: on an interleaved file, mostly video.
+//! until it next collects: on an interleaved file, mostly video.
 //!
-//! The price is a lag of one audio packet: the audio `exchange` returns belongs to the PREVIOUS
-//! audio packet, and nothing comes back on the first one after the open or a seek.
-//! [`PcmPipeline::next_feed_pts`] names, before the call, the packet whose audio it will return,
-//! so the demux thread's bookkeeping (`first_audio_pts`, the pre-audio headroom, the audio tail)
-//! records the audio that actually reached the lane.
+//! **Collected early, not only at the next audio packet.** An `exchange` returns the PREVIOUS
+//! audio packet's audio, and nothing on the first one after the open or a seek, so a decode
+//! collected only there would reach the lane one audio packet late. That lag is not harmless: the
+//! video lane's pre-audio headroom (`ff::PreAudioHeadroom`) decides whether a full video lane may
+//! park or must fail the open by whether audio has been pushed, and a late track whose first
+//! packet is still on the worker when the video lane fills would fail an open that inline decode
+//! passed. So the demux thread also calls [`PcmPipeline::poll`] before every video push: it
+//! collects a finished decode without waiting, and waits for one still running only when that
+//! video push would park. `poll` never submits, so the one-in-flight rule holds.
 //!
 //! **Seeking and teardown.** [`PcmPipeline::reset`] collects and discards the decode in flight
 //! (pre-seek audio), resets the decoder on the worker, and returns once that has happened, so the
@@ -139,9 +145,36 @@ impl<P> Worker<P> {
             return Ok(None);
         };
         match self.resp_rx.recv() {
-            Ok(Response::Decoded(r)) => r.map(|(pcm_pts, pcm)| Some(Decoded { packet_pts, pcm_pts, pcm })),
-            Ok(Response::Reset) => unreachable!("a Decode request answers Decoded, never Reset"),
+            Ok(resp) => Self::decoded(packet_pts, resp),
             Err(_) => self.gone(),
+        }
+    }
+
+    /// The decode in flight if the worker has finished it; with `wait`, wait for it if it has not.
+    fn poll(&mut self, wait: bool) -> Result<Option<Decoded>, String> {
+        let Some(packet_pts) = self.in_flight else {
+            return Ok(None);
+        };
+        if wait {
+            return self.collect();
+        }
+        match self.resp_rx.try_recv() {
+            Ok(resp) => {
+                self.in_flight = None;
+                Self::decoded(packet_pts, resp)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.in_flight = None;
+                self.gone()
+            }
+        }
+    }
+
+    fn decoded(packet_pts: i64, resp: Response) -> Result<Option<Decoded>, String> {
+        match resp {
+            Response::Decoded(r) => r.map(|(pcm_pts, pcm)| Some(Decoded { packet_pts, pcm_pts, pcm })),
+            Response::Reset => unreachable!("a Decode request answers Decoded, never Reset"),
         }
     }
 
@@ -253,13 +286,14 @@ impl<D: PacketDecoder> PcmPipeline<D> {
         matches!(self.mode, Mode::Worker(_))
     }
 
-    /// The `packet_pts` of the audio an [`exchange`](Self::exchange) of a packet at `pts` would
-    /// return: the decode in flight on the worker (`None` when nothing is), or `pts` itself
-    /// inline.
-    pub(crate) fn next_feed_pts(&self, pts: i64) -> Option<i64> {
-        match &self.mode {
-            Mode::Worker(w) => w.in_flight,
-            Mode::Inline(_) => Some(pts),
+    /// Collect the decode in flight without submitting anything: `Ok(None)` when nothing is in
+    /// flight or (without `wait`) the worker is still on it; with `wait`, block until it is done.
+    /// Always `Ok(None)` inline, where `exchange` returns each packet's audio itself. `Err` as for
+    /// [`exchange`](Self::exchange).
+    pub(crate) fn poll(&mut self, wait: bool) -> Result<Option<Decoded>, String> {
+        match &mut self.mode {
+            Mode::Worker(w) => w.poll(wait),
+            Mode::Inline(_) => Ok(None),
         }
     }
 
@@ -381,7 +415,6 @@ mod tests {
         let resets = Arc::clone(&fake.resets);
         let mut p = start(fake);
         assert_eq!(p.exchange((), 1), Ok(None));
-        assert_eq!(p.next_feed_pts(2), Some(1));
         // Taken before the releaser exists, so its 50 ms sleep is wholly inside the measured span
         // however late the OS schedules this thread after the spawn.
         let t0 = Instant::now();
@@ -395,7 +428,6 @@ mod tests {
         assert!(t0.elapsed() >= Duration::from_millis(40), "the second exchange must wait for decode 1");
         p.reset();
         assert_eq!(resets.load(Ordering::SeqCst), 1);
-        assert_eq!(p.next_feed_pts(3), None, "nothing is in flight after a seek");
         assert_eq!(p.exchange((), 3), Ok(None));
         assert_eq!(p.drain_final(), Ok(Some(decoded(3))));
         releaser.join().unwrap();
@@ -410,7 +442,6 @@ mod tests {
         assert_eq!(p.exchange((), 10), Ok(None));
         assert_eq!(p.exchange((), 20), Ok(Some(decoded(10))));
         assert_eq!(p.exchange((), 30), Ok(Some(decoded(20))));
-        assert_eq!(p.next_feed_pts(40), Some(30));
         assert_eq!(p.drain_final(), Ok(Some(decoded(30))));
         assert_eq!(p.drain_final(), Ok(None), "the last decode is handed back once");
         assert_eq!(*calls.lock().unwrap(), vec![10, 20, 30]);
@@ -469,6 +500,45 @@ mod tests {
         drop(p);
     }
 
+    /// `poll` collects a finished decode without submitting anything, waits only when asked to,
+    /// and leaves the next `exchange` with nothing to collect.
+    #[test]
+    fn poll_collects_the_decode_in_flight_and_waits_only_when_asked() {
+        let (release, hold) = mpsc::channel();
+        let fake = FakeDecoder { hold: Some(hold), ..FakeDecoder::default() };
+        let calls = Arc::clone(&fake.calls);
+        let mut p = start(fake);
+        assert_eq!(p.poll(false), Ok(None), "nothing in flight");
+        assert_eq!(p.poll(true), Ok(None), "nothing in flight, nothing to wait for");
+        assert_eq!(p.exchange((), 1), Ok(None));
+        assert_eq!(p.poll(false), Ok(None), "decode 1 is held: not finished, not waited for");
+        release.send(()).unwrap();
+        assert_eq!(p.poll(true), Ok(Some(decoded(1))), "waited for decode 1");
+        assert_eq!(p.poll(false), Ok(None), "handed back once");
+        assert_eq!(p.exchange((), 2), Ok(None), "decode 1 was already collected");
+        release.send(()).unwrap();
+        // Without waiting: finished soon after the release, so a bounded spin must see it.
+        let until = Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            match p.poll(false) {
+                Ok(None) if Instant::now() < until => std::thread::yield_now(),
+                other => break other,
+            }
+        };
+        assert_eq!(got, Ok(Some(decoded(2))));
+        assert_eq!(p.drain_final(), Ok(None));
+        assert_eq!(*calls.lock().unwrap(), vec![1, 2], "poll never submits");
+    }
+
+    #[test]
+    fn poll_on_a_dead_worker_fails_and_so_does_every_later_call() {
+        let mut p = start(FakeDecoder { panic_at: Some(1), ..FakeDecoder::default() });
+        assert_eq!(p.exchange((), 1), Ok(None));
+        assert_eq!(p.poll(true), Err(GONE.to_owned()));
+        assert_eq!(p.exchange((), 2), Err(GONE.to_owned()));
+        assert_eq!(p.poll(false), Ok(None), "nothing was submitted");
+    }
+
     /// The OS refused the thread: the decoder stays on the caller's thread and each packet is
     /// decoded inside its own `exchange`, with no lag.
     #[test]
@@ -477,7 +547,7 @@ mod tests {
         let resets = Arc::clone(&fake.resets);
         let mut p = PcmPipeline::start_with(fake, |_, _| None);
         assert!(!p.off_thread());
-        assert_eq!(p.next_feed_pts(7), Some(7));
+        assert_eq!(p.poll(true), Ok(None), "inline, nothing is ever in flight");
         assert_eq!(p.exchange((), 7), Ok(Some(decoded(7))));
         assert_eq!(p.exchange((), 8), Ok(Some(decoded(8))));
         assert_eq!(p.drain_final(), Ok(None));

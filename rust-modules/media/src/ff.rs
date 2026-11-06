@@ -8849,6 +8849,96 @@ struct AudioStep {
     release: bool,
 }
 
+/// After an audio push that returned `pushed` (`aq_push_gated`'s result): whether the read loop
+/// must stop. At the ceiling it also says why and fails the stream.
+fn audio_push_stops(pushed: c_int, aqa_p: *mut AuQueue, headroom: &PreAudioHeadroom) -> bool {
+    if pushed == crate::aq::PUSH_CEILING {
+        // The audio lane is at its ceiling, the video lane is starved and the
+        // video read so far cannot prime the clock: parking would be a spinner
+        // nobody can leave. Fail the way the video side does, so the route
+        // recovers (Auto Original -> HLS) or the failure read-out shows.
+        crate::player::log(&format!(
+            "ff: no usable video after {} bytes of audio queued (ceiling {} = base + the {} byte audio headroom; {} ms of video read); failing the stream",
+            crate::aq::aq_bytes(aqa_p),
+            crate::aq::aq_cap(aqa_p) + AUDIO_AHEAD_HEADROOM,
+            AUDIO_AHEAD_HEADROOM,
+            headroom.video_reach_ns() / 1_000_000
+        ));
+        SHARED.fail_demux(DemuxExitClass::NoUsableVideo);
+        SHARED.demux_io_failed.store(true, Ordering::Release);
+    }
+    pushed != 0
+}
+
+/// The audio packet at `pts` went to the audio lane (or into the PCM batcher, which pushes it
+/// with the AU it is gathered into): the pre-audio headroom's marks and the audio tail.
+fn audio_pushed(headroom: &mut PreAudioHeadroom, aq_p: *mut AuQueue, pts: i64) {
+    let step = headroom.after_audio(pts);
+    if step.first && headroom.granted {
+        // The late audio arrived: say how far ahead video had to run.
+        crate::player::log(&format!(
+            "ff: first audio at {}ms after {} bytes of video queued ahead of it",
+            pts / 1_000_000,
+            crate::aq::aq_bytes(aq_p)
+        ));
+    }
+    if step.release {
+        // The engine's lead-in is on the audio lane: from here the video lane
+        // falls back to its base cap as the consumer drains it, never under what
+        // it holds (see `PRE_AUDIO_VIDEO_HEADROOM`).
+        crate::aq::aq_release_headroom(aq_p);
+        crate::player::log(&format!(
+            "ff: audio lead-in pushed ({}ms past the first); video headroom released with {} bytes queued",
+            (pts - headroom.first_audio_ns.unwrap_or(pts)) / 1_000_000,
+            crate::aq::aq_bytes(aq_p)
+        ));
+    }
+    SHARED.hls_audio_tail_ns.store(pts, Ordering::Release);
+}
+
+/// One collected PCM decode (`PcmPipeline::exchange`, `poll` or `drain_final`) into the audio
+/// lane, marked by the pts of the packet it was decoded from: `first_audio_pts` before the push,
+/// [`audio_pushed`] after it, exactly what an inline decode of that packet got. Whether the read
+/// loop may go on: `false` after a decode failure (logged and flagged, fatal to the demux, as an
+/// inline decode failure always was) or a push that stops it ([`audio_push_stops`]).
+fn feed_app_decoded(
+    collected: Result<Option<crate::ff_pcm_pipeline::Decoded>, String>,
+    codec: Option<&str>,
+    batch: Option<&mut crate::ff_pcm::AuBatcher>,
+    headroom: &mut PreAudioHeadroom,
+    aqa_p: *mut AuQueue,
+    aq_p: *mut AuQueue,
+    drain: impl FnMut() -> bool,
+) -> bool {
+    let d = match collected {
+        Ok(Some(d)) => d,
+        Ok(None) => return true,
+        Err(why) => {
+            crate::player::log(&format!(
+                "ff: {} decode failed — {why}; refusing audio feed",
+                codec.unwrap_or("audio")
+            ));
+            SHARED.demux_failed.store(true, Ordering::Release);
+            SHARED.demux_io_failed.store(true, Ordering::Release);
+            return false;
+        }
+    };
+    if headroom.first_audio_ns.is_none() {
+        // Before the push, so the feed thread that pops this AU sees it.
+        SHARED.first_audio_pts.store(d.packet_pts, Ordering::Release);
+    }
+    let gate = audio_push_gate(aq_p, headroom.video_reach_ns());
+    let pushed = match batch.and_then(|b| b.push(d.pcm_pts, &d.pcm)) {
+        None => 0,
+        Some((au_pts, au)) => crate::aq::aq_push_gated(aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, gate, drain),
+    };
+    if audio_push_stops(pushed, aqa_p, headroom) {
+        return false;
+    }
+    audio_pushed(headroom, aq_p, d.packet_pts);
+    true
+}
+
 #[cfg(test)]
 mod audio_codec_name_tests {
     use super::*;
@@ -9558,10 +9648,11 @@ pub fn demux(
                     free_avio(avio);
                     break;
                 }
-                // The decode itself (`avcodec_send_packet`/`avcodec_receive_frame`) runs on its own
-                // thread (`ff_pcm_pipeline::PcmPipeline`, inline here if that thread is refused).
-                // Every other step (the batcher, the push gate, the fatal break on a decode error)
-                // stays on this thread; see the module doc.
+                // `PcmDecoder::decode` (FFmpeg's send/receive and the `PcmConverter` downmix and
+                // resample after it) runs on its own thread (`ff_pcm_pipeline::PcmPipeline`, inline
+                // here if that thread is refused). Every other step (the batcher, the push gate, the
+                // headroom marks, the fatal break on a decode error) stays on this thread; see the
+                // module doc.
                 let mut pcm_pipeline: Option<crate::ff_pcm_pipeline::PcmPipeline> = None;
                 let mut pcm_batch: Option<crate::ff_pcm::AuBatcher> = None;
                 if let Some(name) = app_decoded.as_deref().filter(|_| {
@@ -9920,35 +10011,20 @@ pub fn demux(
                         // `frame_read_failed`. NOT an app seek — that is serviced at the top of this
                         // loop and never surfaces as a read error.
                         //
-                        // The PCM worker still holds the last audio packet's decode: collect it
+                        // The PCM worker may still hold the last audio packet's decode: collect it
                         // (waiting, if the worker is still on it) before the batcher's final flush,
-                        // or the stream's last audio packet would be dropped.
+                        // or the stream's last audio packet would be dropped. It is marked like any
+                        // other: after a seek near the end it can be the first audio of its epoch.
                         if let Some(pipeline) = pcm_pipeline.as_mut() {
-                            match pipeline.drain_final() {
-                                Ok(Some(last)) => {
-                                    let pushed = match pcm_batch.as_mut().and_then(|b| b.push(last.pcm_pts, &last.pcm)) {
-                                        None => 0,
-                                        Some((au_pts, au)) => crate::aq::aq_push_gated(
-                                            aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, audio_push_gate(aq_p, headroom.video_reach_ns()),
-                                            || state.drain_wire(),
-                                        ),
-                                    };
-                                    if pushed == 0 {
-                                        SHARED.hls_audio_tail_ns.store(last.packet_pts, Ordering::Release);
-                                    }
-                                }
-                                Err(why) => {
-                                    // The stream's very last audio packet failed to decode. Not
-                                    // this thread's ordinary decode-error path (that one `break`s
-                                    // before any of this is reached) — flag it the same way so
-                                    // whatever reads these after the loop cannot mistake a late
-                                    // decode failure for a clean end of stream.
-                                    crate::player::log(&format!("ff: final PCM decode failed — {why}"));
-                                    SHARED.demux_failed.store(true, Ordering::Release);
-                                    SHARED.demux_io_failed.store(true, Ordering::Release);
-                                }
-                                Ok(None) => {}
-                            }
+                            feed_app_decoded(
+                                pipeline.drain_final(),
+                                app_decoded.as_deref(),
+                                pcm_batch.as_mut(),
+                                &mut headroom,
+                                aqa_p,
+                                aq_p,
+                                || state.drain_wire(),
+                            );
                         }
                         if let Some((au_pts, au)) = pcm_batch.as_mut().and_then(|b| b.take()) {
                             crate::aq::aq_push_gated(
@@ -10060,6 +10136,25 @@ pub fn demux(
                                 head
                             ));
                         }
+                        // A PCM decode the worker has finished goes to the audio lane before this
+                        // video push, and one still running is waited for when the push would park:
+                        // the headroom below must see the audio a decode inline would have pushed
+                        // by now (`ff_pcm_pipeline`'s module doc).
+                        if let Some(pipeline) = pcm_pipeline.as_mut() {
+                            let collected = pipeline.poll(crate::aq::aq_would_park(aq_p));
+                            if !feed_app_decoded(
+                                collected,
+                                app_decoded.as_deref(),
+                                pcm_batch.as_mut(),
+                                &mut headroom,
+                                aqa_p,
+                                aq_p,
+                                || state.drain_wire(),
+                            ) {
+                                av_packet_unref(pkt);
+                                break;
+                            }
+                        }
                         match headroom.before_video(
                             ai >= 0 && FEED_AUDIO.load(Ordering::Relaxed),
                             crate::aq::aq_would_park(aq_p),
@@ -10112,21 +10207,38 @@ pub fn demux(
                         PUSHED_ANY.store(true, Ordering::Relaxed);
                         SHARED.hls_video_tail_ns.store(pts, Ordering::Release);
                         headroom.video_pushed(pts);
+                    } else if si == ai && FEED_AUDIO.load(Ordering::Relaxed) && pcm_pipeline.is_some() {
+                        // App-decoded audio. This packet goes to the PCM worker and the decode in
+                        // flight, the previous audio packet's, comes back (`exchange` waits for it if
+                        // the worker is still on it; the video arm's `poll` may have collected it
+                        // already), so decode N runs beside everything read until it is collected.
+                        // What comes back goes through the batcher, the gate and `drain_wire` here,
+                        // as it did inline, and is marked by ITS packet's pts, not this one's.
+                        let pts = pts_ns(pkt, *streams.add(ai as usize));
+                        let pipeline = pcm_pipeline.as_mut().expect("this arm is taken only with a pipeline");
+                        let collected = match crate::ff_pcm_pipeline::ClonedPacket::of(pkt) {
+                            Some(clone) => pipeline.exchange(clone, pts),
+                            None => Err("av_packet_clone failed".to_owned()),
+                        };
+                        av_packet_unref(pkt);
+                        if !feed_app_decoded(
+                            collected,
+                            app_decoded.as_deref(),
+                            pcm_batch.as_mut(),
+                            &mut headroom,
+                            aqa_p,
+                            aq_p,
+                            || state.drain_wire(),
+                        ) {
+                            break;
+                        }
                     } else if si == ai && FEED_AUDIO.load(Ordering::Relaxed) {
                         let ast = *streams.add(ai as usize);
                         let pts = pts_ns(pkt, ast);
-                        // The packet whose audio this one puts in the lane: this one, except on the
-                        // PCM worker, which hands back the PREVIOUS audio packet's decode (none
-                        // after the open or a seek; `PcmPipeline::exchange`). The marks below
-                        // follow the audio that was pushed, not the packet just read.
-                        let fed_pts = match pcm_pipeline.as_ref() {
-                            Some(p) if speed_dec.is_none() && aac_adts.is_none() => p.next_feed_pts(pts),
-                            _ => Some(pts),
-                        };
-                        if let Some(fed) = fed_pts.filter(|_| headroom.first_audio_ns.is_none()) {
+                        if headroom.first_audio_ns.is_none() {
                             // Before the push, so the feed thread that pops this AU sees it: the
                             // audio lane feeds a late-starting track's first AU on this mark.
-                            SHARED.first_audio_pts.store(fed, Ordering::Release);
+                            SHARED.first_audio_pts.store(pts, Ordering::Release);
                         }
                         // The audio lane runs past its soft cap while the video lane is starved
                         // ([`AUDIO_AHEAD_HEADROOM`]); the gate is what makes that decision, here.
@@ -10158,38 +10270,6 @@ pub fn demux(
                                 gate,
                                 || state.drain_wire(),
                             )
-                        } else if let Some(pipeline) = pcm_pipeline.as_mut() {
-                            // This packet goes to the worker and the previous audio packet's decode
-                            // comes back (`exchange` waits for it if the worker is still on it), so
-                            // decode N runs beside everything read until audio packet N+1. The
-                            // batcher, the gate and `drain_wire` run here, as they did inline.
-                            let fed = match crate::ff_pcm_pipeline::ClonedPacket::of(pkt) {
-                                Some(clone) => pipeline.exchange(clone, pts),
-                                None => Err("av_packet_clone failed".to_owned()),
-                            };
-                            match fed {
-                                Ok(None) => 0,
-                                Ok(Some(d)) => {
-                                    debug_assert_eq!(Some(d.packet_pts), fed_pts, "next_feed_pts named another packet");
-                                    match pcm_batch.as_mut().and_then(|b| b.push(d.pcm_pts, &d.pcm)) {
-                                        None => 0,
-                                        Some((au_pts, au)) => crate::aq::aq_push_gated(
-                                            aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, gate,
-                                            || state.drain_wire(),
-                                        ),
-                                    }
-                                }
-                                Err(why) => {
-                                    crate::player::log(&format!(
-                                        "ff: {} decode failed — {why}; refusing audio feed",
-                                        app_decoded.as_deref().unwrap_or("audio")
-                                    ));
-                                    SHARED.demux_failed.store(true, Ordering::Release);
-                                    SHARED.demux_io_failed.store(true, Ordering::Release);
-                                    av_packet_unref(pkt);
-                                    break;
-                                }
-                            }
                         } else if dts_audio {
                             let raw = std::slice::from_raw_parts((*pkt).data, (*pkt).size.max(0) as usize);
                             let Some(core) = dts_core_packet(raw) else {
@@ -10217,48 +10297,10 @@ pub fn demux(
                             // AUDIO lane
                         };
                         av_packet_unref(pkt);
-                        if pushed == crate::aq::PUSH_CEILING {
-                            // The audio lane is at its ceiling, the video lane is starved and the
-                            // video read so far cannot prime the clock: parking would be a spinner
-                            // nobody can leave. Fail the way the video side does, so the route
-                            // recovers (Auto Original -> HLS) or the failure read-out shows.
-                            crate::player::log(&format!(
-                                "ff: no usable video after {} bytes of audio queued (ceiling {} = base + the {} byte audio headroom; {} ms of video read); failing the stream",
-                                crate::aq::aq_bytes(aqa_p),
-                                crate::aq::aq_cap(aqa_p) + AUDIO_AHEAD_HEADROOM,
-                                AUDIO_AHEAD_HEADROOM,
-                                headroom.video_reach_ns() / 1_000_000
-                            ));
-                            SHARED.fail_demux(DemuxExitClass::NoUsableVideo);
-                            SHARED.demux_io_failed.store(true, Ordering::Release);
+                        if audio_push_stops(pushed, aqa_p, &headroom) {
                             break;
                         }
-                        if pushed != 0 {
-                            break;
-                        }
-                        if let Some(fed) = fed_pts {
-                            let step = headroom.after_audio(fed);
-                            if step.first && headroom.granted {
-                                // The late audio arrived: say how far ahead video had to run.
-                                crate::player::log(&format!(
-                                    "ff: first audio at {}ms after {} bytes of video queued ahead of it",
-                                    fed / 1_000_000,
-                                    crate::aq::aq_bytes(aq_p)
-                                ));
-                            }
-                            if step.release {
-                                // The engine's lead-in is on the audio lane: from here the video lane
-                                // falls back to its base cap as the consumer drains it, never under what
-                                // it holds (see `PRE_AUDIO_VIDEO_HEADROOM`).
-                                crate::aq::aq_release_headroom(aq_p);
-                                crate::player::log(&format!(
-                                    "ff: audio lead-in pushed ({}ms past the first); video headroom released with {} bytes queued",
-                                    (fed - headroom.first_audio_ns.unwrap_or(fed)) / 1_000_000,
-                                    crate::aq::aq_bytes(aq_p)
-                                ));
-                            }
-                            SHARED.hls_audio_tail_ns.store(fed, Ordering::Release);
-                        }
+                        audio_pushed(&mut headroom, aq_p, pts);
                     } else if let Some(sub_pos) = sub_tracks.position(si) {
                         // Subtitle packet: `SubTracks::decode` yields a cue for EVERY text track
                         // (not just the selected one) and decodes every image track while subtitles
