@@ -1399,3 +1399,216 @@ fn a_transport_streams_aac_gets_one_adts_header_not_two() {
     );
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// App-decoded audio (FLAC here): the decode runs on the PCM worker (`ff_pcm_pipeline`).
+// ---------------------------------------------------------------------------------------------
+//
+// The worker hands each packet's audio back one exchange late, so these pin that the demuxer
+// still puts every packet's audio in the lane, and marks it (`first_audio_pts`, the pre-audio
+// headroom) as an inline decode did: a late track whose only packet is read with the video lane
+// already past its base cap, an ordinary interleaved file read to the end, and a resume whose
+// only audio is the file's last packet.
+
+/// The Load's declared PCM for these fixtures (48 kHz stereo S16, the FLAC's own shape), reset to
+/// none however the test leaves: a PCM Load leaked into another test refuses its E-AC-3 track.
+struct DeclaredPcm;
+
+impl DeclaredPcm {
+    fn flac() -> DeclaredPcm {
+        set_pcm_out(Some(crate::ff_pcm::PcmOut::exact(48_000, 16, 2)), false);
+        DeclaredPcm
+    }
+}
+
+impl Drop for DeclaredPcm {
+    fn drop(&mut self) {
+        set_pcm_out(None, false);
+    }
+}
+
+/// `-c:a flac` of a 440 Hz stereo S16 sine: `duration_s` of it, starting `delay_s` into the file.
+fn flac_audio_args(delay_s: f64, duration_s: f64) -> Vec<String> {
+    [
+        "-itsoffset".to_owned(),
+        format!("{delay_s}"),
+        "-f".to_owned(),
+        "lavfi".to_owned(),
+        "-i".to_owned(),
+        format!("sine=frequency=440:sample_rate=48000:duration={duration_s}"),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// An MKV of `video_s` seconds of 640x360 H.264 noise at `video_bps` (keyframe every second) and
+/// `audio_s` seconds of FLAC whose first packet is `delay_s` in.
+fn generate_flac(dir: &Path, video_s: u32, video_bps: &str, delay_s: f64, audio_s: f64) -> PathBuf {
+    let out = dir.join("flac.mkv");
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", &format!("color=c=gray:s=640x360:r=25:d={video_s},noise=alls=100:allf=t+u")])
+        .args(flac_audio_args(delay_s, audio_s))
+        .args(["-map", "0:v", "-map", "1:a"])
+        .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "25"])
+        .args(["-b:v", video_bps, "-maxrate", video_bps, "-bufsize", video_bps])
+        .args(["-c:a", "flac", "-ac", "2", "-sample_fmt", "s16"])
+        .arg(&out)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg could not write the FLAC fixture");
+    out
+}
+
+/// The pts (seconds) of every audio packet in the file.
+fn audio_packet_times(path: &Path) -> Vec<f64> {
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "packet=pts_time"])
+        .args(["-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(probe.status.success(), "ffprobe could not read the fixture");
+    String::from_utf8_lossy(&probe.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect()
+}
+
+/// Pop every audio AU until the demuxer has finished and the lane is empty (or the deadline):
+/// the pts of each, in order.
+fn drain_audio_to_the_end(run: &mut DemuxRun, deadline: Duration) -> Vec<i64> {
+    let until = Instant::now() + deadline;
+    let mut pts = Vec::new();
+    while Instant::now() < until {
+        let done = run.finished();
+        let node = crate::aq::aq_pop(&mut *run.audio, std::ptr::null_mut());
+        if !node.is_null() {
+            let (es, _key, at, _len, _data) = unsafe { crate::aq::au_fields(node) };
+            unsafe { libc::free(node as *mut c_void) };
+            assert_eq!(es, 2, "the audio lane carries es=2 AUs");
+            pts.push(at);
+            continue;
+        }
+        if done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    pts
+}
+
+/// **The one-exchange lag must not hide a late track's audio from the pre-audio headroom.** The
+/// FLAC track's only packet is read 11 s in, with ~16 MB of video already queued (past the video
+/// lane's base cap, so the headroom grant is already standing), and the rest of the file is video
+/// enough to fill the grant. Decoded inline, that packet's audio was in the lane at once, the
+/// headroom saw audio, and the full lane parked like any full lane. Handed to the PCM worker and
+/// collected only at the next audio packet (there is none), it reached the lane never: the lane
+/// filled the grant with no audio pushed and the open failed (`NoAudioAu`).
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI — see the module doc"]
+fn a_late_app_decoded_track_reaches_the_lane_before_the_video_lane_fills_its_headroom() {
+    let _g = plx_base::testlock::serial();
+    let _pcm = DeclaredPcm::flac();
+    let mut audio_times = Vec::new();
+    let Some(mut p) = prepare_with_audio("late-flac", "flac", |dir| {
+        let f = generate_flac(dir, 30, "12M", LATE_AUDIO_DELAY_S, 0.05);
+        audio_times = audio_packet_times(&f);
+        f
+    }) else {
+        return;
+    };
+    let (video_cap, _) = crate::player::engine::aq_caps();
+    assert_eq!(audio_times.len(), 1, "fixture: one FLAC packet, got {audio_times:?}");
+    assert!(
+        (p.first_audio_s - LATE_AUDIO_DELAY_S).abs() < 0.1,
+        "fixture: the audio packet must be at ~{LATE_AUDIO_DELAY_S} s, got {}",
+        p.first_audio_s
+    );
+    assert!(
+        p.video_before as i64 > video_cap,
+        "fixture: {} bytes of video before the audio must exceed the {video_cap}-byte base cap",
+        p.video_before
+    );
+
+    let seen = p.run.observe(FIRST_AUDIO_DEADLINE, 0);
+    let pts = seen.first_audio_pts_ns.unwrap_or_else(|| {
+        panic!(
+            "the FLAC packet's audio never reached the audio lane within {FIRST_AUDIO_DEADLINE:?} \
+             (video lane {} bytes, demux_io_failed={}, demuxer finished={})",
+            seen.video_lane_bytes,
+            SHARED.demux_io_failed.load(Ordering::Acquire),
+            p.run.finished()
+        )
+    });
+    assert!(
+        (pts / 1_000_000 - (LATE_AUDIO_DELAY_S * 1000.0) as i64).abs() < 100,
+        "the AU is the packet at ~{LATE_AUDIO_DELAY_S} s, got {} ms",
+        pts / 1_000_000
+    );
+    assert_eq!(SHARED.first_audio_pts.load(Ordering::Acquire), pts, "the first-audio mark names that AU");
+
+    // Then the video lane fills to the grant and parks there: a full lane with audio in, not a
+    // failed open.
+    let headroom = video_cap + PRE_AUDIO_VIDEO_HEADROOM as i64;
+    let until = Instant::now() + FIRST_AUDIO_DEADLINE;
+    while !p.run.finished() && i64::from(crate::aq::aq_bytes(p.run.video_lane())) < headroom * 9 / 10 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!SHARED.demux_io_failed.load(Ordering::Acquire), "the open must not fail with the audio pushed");
+    assert!(!p.run.finished(), "the demuxer parks on the full video lane rather than ending");
+}
+
+/// An ordinary interleaved FLAC file read to the end: every packet's audio reaches the lane once,
+/// in order, the last one included (it is collected at EOF, `PcmPipeline::drain_final`), and the
+/// first-audio mark is the first AU's pts.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI — see the module doc"]
+fn every_app_decoded_packet_reaches_the_lane_once_in_order_with_the_first_marked() {
+    let _g = plx_base::testlock::serial();
+    let _pcm = DeclaredPcm::flac();
+    let mut audio_times = Vec::new();
+    let Some(mut p) = prepare_with_audio("flac-whole", "flac", |dir| {
+        let f = generate_flac(dir, 4, "1M", 0.2, 3.0);
+        audio_times = audio_packet_times(&f);
+        f
+    }) else {
+        return;
+    };
+    assert!(audio_times.len() > 10, "fixture: an interleaved FLAC track, got {audio_times:?}");
+    let pts = drain_audio_to_the_end(&mut p.run, FIRST_AUDIO_DEADLINE);
+    assert!(p.run.finished(), "the demuxer must reach the end of a four second file");
+    assert!(!SHARED.demux_failed.load(Ordering::Acquire) && !SHARED.demux_io_failed.load(Ordering::Acquire));
+    let want: Vec<i64> = audio_times.iter().map(|t| (t * 1000.0).round() as i64).collect();
+    let got: Vec<i64> = pts.iter().map(|ns| ns / 1_000_000).collect();
+    assert_eq!(got, want, "one AU per FLAC packet, in file order, the last one included (ms)");
+    assert_eq!(SHARED.first_audio_pts.load(Ordering::Acquire), pts[0], "the first-audio mark names the first AU");
+}
+
+/// A resume (a seek serviced before the first read) into a file whose only audio after the seek
+/// point is its LAST packet, after the video has ended. That packet's decode is still on the
+/// worker at EOF and only `drain_final` collects it; it is the first audio of the epoch, so it
+/// must carry the first-audio mark the engine's late-track feed keys on (`opens`), as it did
+/// when it was decoded inline.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI — see the module doc"]
+fn audio_collected_only_at_eof_after_a_seek_still_carries_the_first_audio_mark() {
+    let _g = plx_base::testlock::serial();
+    let _pcm = DeclaredPcm::flac();
+    let mut audio_times = Vec::new();
+    let Some(mut p) = prepare_at("flac-eof-seek", "flac", 3_500_000_000, |dir| {
+        let f = generate_flac(dir, 4, "1M", 4.2, 0.05);
+        audio_times = audio_packet_times(&f);
+        f
+    }) else {
+        return;
+    };
+    assert_eq!(audio_times.len(), 1, "fixture: one FLAC packet, got {audio_times:?}");
+    let pts = drain_audio_to_the_end(&mut p.run, FIRST_AUDIO_DEADLINE);
+    assert!(p.run.finished(), "the demuxer must reach the end of a four second file");
+    assert!(!SHARED.demux_failed.load(Ordering::Acquire) && !SHARED.demux_io_failed.load(Ordering::Acquire));
+    assert_eq!(pts.len(), 1, "the file's one audio packet reaches the lane: {pts:?}");
+    assert!((pts[0] / 1_000_000 - 4_200).abs() < 50, "it is the packet at 4.2 s, got {} ms", pts[0] / 1_000_000);
+    assert_eq!(
+        SHARED.first_audio_pts.load(Ordering::Acquire),
+        pts[0],
+        "the first audio of the seek's epoch carries the first-audio mark"
+    );
+}
