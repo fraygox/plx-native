@@ -1427,6 +1427,10 @@ impl Drop for DeclaredPcm {
     }
 }
 
+/// A FLAC track this short is ONE packet: lavfi's `sine` hands the encoder 1024-sample frames
+/// (21 ms at 48 kHz), and 0.02 s is 960 samples, under one frame.
+const ONE_FLAC_PACKET_S: f64 = 0.02;
+
 /// `-c:a flac` of a 440 Hz stereo S16 sine: `duration_s` of it, starting `delay_s` into the file.
 fn flac_audio_args(delay_s: f64, duration_s: f64) -> Vec<String> {
     [
@@ -1509,7 +1513,7 @@ fn a_late_app_decoded_track_reaches_the_lane_before_the_video_lane_fills_its_hea
     let _pcm = DeclaredPcm::flac();
     let mut audio_times = Vec::new();
     let Some(mut p) = prepare_with_audio("late-flac", "flac", |dir| {
-        let f = generate_flac(dir, 30, "12M", LATE_AUDIO_DELAY_S, 0.05);
+        let f = generate_flac(dir, 30, "12M", LATE_AUDIO_DELAY_S, ONE_FLAC_PACKET_S);
         audio_times = audio_packet_times(&f);
         f
     }) else {
@@ -1594,7 +1598,7 @@ fn audio_collected_only_at_eof_after_a_seek_still_carries_the_first_audio_mark()
     let _pcm = DeclaredPcm::flac();
     let mut audio_times = Vec::new();
     let Some(mut p) = prepare_at("flac-eof-seek", "flac", 3_500_000_000, |dir| {
-        let f = generate_flac(dir, 4, "1M", 4.2, 0.05);
+        let f = generate_flac(dir, 4, "1M", 4.2, ONE_FLAC_PACKET_S);
         audio_times = audio_packet_times(&f);
         f
     }) else {
