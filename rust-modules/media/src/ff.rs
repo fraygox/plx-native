@@ -455,6 +455,11 @@ plx_base::dynlib! {
     fn av_packet_alloc() -> *mut AVPacket;
     fn av_packet_free(pkt: *mut *mut AVPacket);
     fn av_packet_unref(pkt: *mut AVPacket);
+    // An independent, ref-counted copy (`ff_pcm_pipeline`): the demux loop's own `pkt` is reused
+    // by the very next `av_read_frame` the instant a packet is handed to the PCM worker thread,
+    // so the worker needs its own copy rather than a borrow of this one. Public libavcodec API
+    // since the 1.x series, same standing as `av_packet_rescale_ts` above.
+    fn av_packet_clone(src: *const AVPacket) -> *mut AVPacket;
     fn avcodec_get_name(id: c_int) -> *const c_char;
     fn av_bsf_get_by_name(name: *const c_char) -> *const AVBitStreamFilter;
     // Image-subtitle software decode (PGS/VobSub/DVB → paletted bitmap). The classic 3.x
@@ -9553,7 +9558,13 @@ pub fn demux(
                     free_avio(avio);
                     break;
                 }
-                let mut pcm_dec: Option<crate::ff_pcm::PcmDecoder> = None;
+                // The decode itself (`avcodec_send_packet`/`avcodec_receive_frame`) runs on its own
+                // thread (`ff_pcm_pipeline::PcmPipeline`) so it no longer competes with this
+                // thread's own `av_read_frame`/AVIO work for CPU on a high-bitrate stream. Every
+                // other step — the batcher, the push gate, the fatal-break on a decode error —
+                // stays on this thread exactly as it was; see the module doc for why.
+                let mut pcm_pipeline: Option<crate::ff_pcm_pipeline::PcmPipeline> = None;
+                let mut pcm_batch: Option<crate::ff_pcm::AuBatcher> = None;
                 if let Some(name) = app_decoded.as_deref().filter(|_| {
                     FEED_AUDIO.load(Ordering::Relaxed) && speed_permille == crate::player::RATE_NORMAL
                 }) {
@@ -9566,10 +9577,14 @@ pub fn demux(
                     match opened {
                         Ok(d) => {
                             crate::player::log(&format!(
-                                "ff: {name} -> PCM decoding on{}",
+                                "ff: {name} -> PCM decoding on{} (off-thread)",
                                 if d.core_only() { " (core only)" } else { "" }
                             ));
-                            pcm_dec = Some(d);
+                            // Decoded blocks shorter than 10 ms (TrueHD's 1/1200 s access units)
+                            // go to the lane gathered into AUs of about that length first — taken
+                            // from `d` before it moves onto the worker.
+                            pcm_batch = Some(d.au_batcher());
+                            pcm_pipeline = Some(crate::ff_pcm_pipeline::PcmPipeline::spawn(d));
                         }
                         Err(why) => {
                             crate::player::log(&format!("ff: {name} refused — {why}"));
@@ -9580,9 +9595,6 @@ pub fn demux(
                         }
                     }
                 }
-                // Decoded blocks shorter than 10 ms (TrueHD's 1/1200 s access units) go to the lane
-                // gathered into AUs of about that length (`ff_pcm::AuBatcher`).
-                let mut pcm_batch = pcm_dec.as_ref().map(|d| d.au_batcher());
                 if let Some((fi, ch)) = aac_adts {
                     crate::player::log(&format!(
                         "ff: AAC → ADTS reframing on (freq_idx={fi} ch={ch})"
@@ -9890,8 +9902,12 @@ pub fn demux(
                         ));
                         headroom.restart(aq_p);
                         annexb_wait_key = (nal_input == NalInput::StartCodes).then_some(0u32);
-                        if let Some(dec) = pcm_dec.as_mut() {
-                            dec.reset_stream();
+                        if let Some(pipeline) = pcm_pipeline.as_mut() {
+                            // Blocks until any in-flight decode from BEFORE the seek is drained
+                            // and discarded and the decoder itself is reset on the worker thread
+                            // — see the module doc on why this ordering is what keeps a stale
+                            // result from ever landing after the reset.
+                            pipeline.reset();
                         }
                         if let Some(batch) = pcm_batch.as_mut() {
                             batch.clear();
@@ -9903,6 +9919,34 @@ pub fn demux(
                         // Genuine end of stream, teardown, or an unrecovered I/O error published by
                         // `frame_read_failed`. NOT an app seek — that is serviced at the top of this
                         // loop and never surfaces as a read error.
+                        //
+                        // The pipeline may still hold the LAST submitted packet's audio: collect it
+                        // (blocking — this is EOF, there is no more demuxing to overlap it with)
+                        // before the batcher's own final flush, or up to one packet of audio from
+                        // the very end of the stream would be silently dropped.
+                        if let Some(pipeline) = pcm_pipeline.as_mut() {
+                            match pipeline.drain_final() {
+                                Some(Ok((pcm_pts, pcm))) => {
+                                    if let Some((au_pts, au)) = pcm_batch.as_mut().and_then(|b| b.push(pcm_pts, &pcm)) {
+                                        crate::aq::aq_push_gated(
+                                            aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, audio_push_gate(aq_p, headroom.video_reach_ns()),
+                                            || state.drain_wire(),
+                                        );
+                                    }
+                                }
+                                Some(Err(why)) => {
+                                    // The stream's very last audio packet failed to decode. Not
+                                    // this thread's ordinary decode-error path (that one `break`s
+                                    // before any of this is reached) — flag it the same way so
+                                    // whatever reads these after the loop cannot mistake a late
+                                    // decode failure for a clean end of stream.
+                                    crate::player::log(&format!("ff: final PCM decode failed — {why}"));
+                                    SHARED.demux_failed.store(true, Ordering::Release);
+                                    SHARED.demux_io_failed.store(true, Ordering::Release);
+                                }
+                                None => {}
+                            }
+                        }
                         if let Some((au_pts, au)) = pcm_batch.as_mut().and_then(|b| b.take()) {
                             crate::aq::aq_push_gated(
                                 aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, audio_push_gate(aq_p, headroom.video_reach_ns()),
@@ -10103,12 +10147,48 @@ pub fn demux(
                                 gate,
                                 || state.drain_wire(),
                             )
-                        } else if let Some(dec) = pcm_dec.as_mut() {
-                            let (pcm_pts, pcm) = match dec.decode(pkt, pts) {
-                                Ok(decoded) => decoded,
-                                Err(why) => {
+                        } else if let Some(pipeline) = pcm_pipeline.as_mut() {
+                            // Collect a PREVIOUSLY submitted packet's decode first — handed off on
+                            // an earlier audio packet, with every packet in between (most of all,
+                            // video) for the worker to decode concurrently with. `aq_push_gated`,
+                            // the gate and `drain_wire` all run here exactly as they did inline;
+                            // only the `avcodec_send_packet`/`avcodec_receive_frame` call itself
+                            // happened off this thread.
+                            let mut pushed = 0;
+                            if let Some(prev) = pipeline.try_collect() {
+                                pushed = match prev {
+                                    Ok((pcm_pts, pcm)) => match pcm_batch.as_mut().and_then(|b| b.push(pcm_pts, &pcm)) {
+                                        None => 0,
+                                        Some((au_pts, au)) => crate::aq::aq_push_gated(
+                                            aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, gate,
+                                            || state.drain_wire(),
+                                        ),
+                                    },
+                                    Err(why) => {
+                                        crate::player::log(&format!(
+                                            "ff: {} decode failed — {why}; refusing audio feed",
+                                            app_decoded.as_deref().unwrap_or("audio")
+                                        ));
+                                        SHARED.demux_failed.store(true, Ordering::Release);
+                                        SHARED.demux_io_failed.store(true, Ordering::Release);
+                                        av_packet_unref(pkt);
+                                        break;
+                                    }
+                                };
+                            }
+                            // Nothing collected (the common case — the worker has not finished
+                            // yet), or a completed batch had nothing to push this packet (still
+                            // gathering): submit THIS packet instead of decoding it here. An
+                            // independent clone, because `pkt` is reused by the very next
+                            // `av_read_frame` the moment this iteration ends.
+                            if pushed == 0 {
+                                let mut clone = av_packet_clone(pkt);
+                                if clone.is_null() || !pipeline.submit(clone, pts) {
+                                    if !clone.is_null() {
+                                        av_packet_free(&mut clone);
+                                    }
                                     crate::player::log(&format!(
-                                        "ff: {} decode failed — {why}; refusing audio feed",
+                                        "ff: {} decode handoff failed; refusing audio feed",
                                         app_decoded.as_deref().unwrap_or("audio")
                                     ));
                                     SHARED.demux_failed.store(true, Ordering::Release);
@@ -10116,14 +10196,8 @@ pub fn demux(
                                     av_packet_unref(pkt);
                                     break;
                                 }
-                            };
-                            match pcm_batch.as_mut().and_then(|b| b.push(pcm_pts, pcm)) {
-                                None => 0,
-                                Some((au_pts, au)) => crate::aq::aq_push_gated(
-                                    aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, gate,
-                                    || state.drain_wire(),
-                                ),
                             }
+                            pushed
                         } else if dts_audio {
                             let raw = std::slice::from_raw_parts((*pkt).data, (*pkt).size.max(0) as usize);
                             let Some(core) = dts_core_packet(raw) else {
