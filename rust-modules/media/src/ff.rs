@@ -8896,6 +8896,30 @@ fn audio_pushed(headroom: &mut PreAudioHeadroom, aq_p: *mut AuQueue, pts: i64) {
     SHARED.hls_audio_tail_ns.store(pts, Ordering::Release);
 }
 
+/// The end of the file for app-decoded audio: `collected` is the PCM pipeline's `drain_final`
+/// (`None` without a pipeline). The last decode goes in as any other ([`feed_app_decoded`]: marked,
+/// and it can be the first audio of a seek's epoch), then whatever the `AuBatcher` still gathers is
+/// flushed as the stream's last AU.
+fn finish_app_decoded_at_eof(
+    collected: Option<Result<Option<crate::ff_pcm_pipeline::Decoded>, String>>,
+    codec: Option<&str>,
+    mut batch: Option<&mut crate::ff_pcm::AuBatcher>,
+    headroom: &mut PreAudioHeadroom,
+    aqa_p: *mut AuQueue,
+    aq_p: *mut AuQueue,
+    mut drain: impl FnMut() -> bool,
+) {
+    if let Some(collected) = collected {
+        feed_app_decoded(collected, codec, batch.as_deref_mut(), headroom, aqa_p, aq_p, &mut drain);
+    }
+    if let Some((au_pts, au)) = batch.and_then(|b| b.take()) {
+        crate::aq::aq_push_gated(
+            aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, audio_push_gate(aq_p, headroom.video_reach_ns()),
+            drain,
+        );
+    }
+}
+
 /// One collected PCM decode (`PcmPipeline::exchange`, `poll` or `drain_final`) into the audio
 /// lane, marked by the pts of the packet it was decoded from: `first_audio_pts` before the push,
 /// [`audio_pushed`] after it, exactly what an inline decode of that packet got. Whether the read
@@ -8937,6 +8961,54 @@ fn feed_app_decoded(
     }
     audio_pushed(headroom, aq_p, d.packet_pts);
     true
+}
+
+#[cfg(test)]
+mod eof_app_decoded_tests {
+    use super::*;
+    use crate::ff_pcm::{AuBatcher, PcmOut};
+    use crate::ff_pcm_pipeline::Decoded;
+
+    /// 1 ms of 48 kHz stereo S16 at `pts_ns`: under the batcher's minimum, so it is gathered.
+    fn short_block(pts_ns: i64) -> Decoded {
+        Decoded { packet_pts: pts_ns, pcm_pts: pts_ns, pcm: vec![0u8; 48 * 4] }
+    }
+
+    /// Run the EOF drain over a batcher already gathering one short block, with `last` as the
+    /// worker's final decode: the bytes left in the audio lane.
+    fn eof_with(last: Result<Option<Decoded>, String>) -> i32 {
+        let mut audio = crate::aq::aq_new(1 << 20);
+        let mut video = crate::aq::aq_new(1 << 20);
+        let mut batch = AuBatcher::new(PcmOut::exact(48_000, 16, 2));
+        assert!(batch.push(0, &short_block(0).pcm).is_none(), "a 1 ms block is gathered, not pushed");
+        let mut headroom = PreAudioHeadroom::default();
+        SHARED.demux_failed.store(false, Ordering::Relaxed);
+        SHARED.demux_io_failed.store(false, Ordering::Relaxed);
+        finish_app_decoded_at_eof(Some(last), Some("truehd"), Some(&mut batch), &mut headroom, &mut *audio, &mut *video, || false);
+        crate::aq::aq_bytes(&mut *audio) as i32
+    }
+
+    /// Regression: a stream whose LAST decode fails is refused like any other decode failure
+    /// (`demux_io_failed`); what the batcher was still gathering is not flushed after it, as the
+    /// inline decode's fatal break never reached that flush.
+    #[test]
+    fn a_failed_last_decode_flushes_nothing_after_it() {
+        let _g = plx_base::testlock::serial();
+        let left = eof_with(Err("bad packet".to_owned()));
+        assert!(SHARED.demux_io_failed.load(Ordering::Acquire), "the failure is flagged");
+        assert_eq!(left, 0, "no AU may be pushed after the stream's last decode failed");
+        SHARED.demux_failed.store(false, Ordering::Relaxed);
+        SHARED.demux_io_failed.store(false, Ordering::Relaxed);
+    }
+
+    /// The ordinary end: the last decode joins what is gathered and the whole is flushed once.
+    #[test]
+    fn a_clean_last_decode_is_flushed_with_what_was_gathered() {
+        let _g = plx_base::testlock::serial();
+        let left = eof_with(Ok(Some(short_block(1_000_000))));
+        assert!(!SHARED.demux_io_failed.load(Ordering::Acquire));
+        assert_eq!(left, 2 * 48 * 4, "both gathered blocks reach the lane as one AU");
+    }
 }
 
 #[cfg(test)]
@@ -10013,25 +10085,16 @@ pub fn demux(
                         //
                         // The PCM worker may still hold the last audio packet's decode: collect it
                         // (waiting, if the worker is still on it) before the batcher's final flush,
-                        // or the stream's last audio packet would be dropped. It is marked like any
-                        // other: after a seek near the end it can be the first audio of its epoch.
-                        if let Some(pipeline) = pcm_pipeline.as_mut() {
-                            feed_app_decoded(
-                                pipeline.drain_final(),
-                                app_decoded.as_deref(),
-                                pcm_batch.as_mut(),
-                                &mut headroom,
-                                aqa_p,
-                                aq_p,
-                                || state.drain_wire(),
-                            );
-                        }
-                        if let Some((au_pts, au)) = pcm_batch.as_mut().and_then(|b| b.take()) {
-                            crate::aq::aq_push_gated(
-                                aqa_p, au.as_ptr(), au.len() as c_int, au_pts, 1, 2, audio_push_gate(aq_p, headroom.video_reach_ns()),
-                                || state.drain_wire(),
-                            );
-                        }
+                        // or the stream's last audio packet would be dropped.
+                        finish_app_decoded_at_eof(
+                            pcm_pipeline.as_mut().map(|p| p.drain_final()),
+                            app_decoded.as_deref(),
+                            pcm_batch.as_mut(),
+                            &mut headroom,
+                            aqa_p,
+                            aq_p,
+                            || state.drain_wire(),
+                        );
                         break;
                     }
                     let si = (*pkt).stream_index;
