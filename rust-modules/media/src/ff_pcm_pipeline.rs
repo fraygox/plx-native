@@ -419,6 +419,7 @@ mod tests {
         assert_eq!(resets.load(Ordering::SeqCst), 2);
         assert_eq!(p.exchange((), 100), Ok(None), "packet 5 was pre-seek audio");
         assert_eq!(p.exchange((), 101), Ok(Some(decoded(100))));
+        assert_eq!(p.drain_final(), Ok(Some(decoded(101))));
         assert_eq!(*calls.lock().unwrap(), vec![1, 2, 3, 4, 5, 100, 101]);
     }
 
