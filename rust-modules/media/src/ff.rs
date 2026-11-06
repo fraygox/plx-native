@@ -8899,7 +8899,9 @@ fn audio_pushed(headroom: &mut PreAudioHeadroom, aq_p: *mut AuQueue, pts: i64) {
 /// The end of the file for app-decoded audio: `collected` is the PCM pipeline's `drain_final`
 /// (`None` without a pipeline). The last decode goes in as any other ([`feed_app_decoded`]: marked,
 /// and it can be the first audio of a seek's epoch), then whatever the `AuBatcher` still gathers is
-/// flushed as the stream's last AU.
+/// flushed as the stream's last AU, unless that feed stopped the stream (a failed decode, a push at
+/// the ceiling): as the inline decode's fatal break never reached the flush, nothing goes out
+/// after the failure.
 fn finish_app_decoded_at_eof(
     collected: Option<Result<Option<crate::ff_pcm_pipeline::Decoded>, String>>,
     codec: Option<&str>,
@@ -8910,7 +8912,9 @@ fn finish_app_decoded_at_eof(
     mut drain: impl FnMut() -> bool,
 ) {
     if let Some(collected) = collected {
-        feed_app_decoded(collected, codec, batch.as_deref_mut(), headroom, aqa_p, aq_p, &mut drain);
+        if !feed_app_decoded(collected, codec, batch.as_deref_mut(), headroom, aqa_p, aq_p, &mut drain) {
+            return;
+        }
     }
     if let Some((au_pts, au)) = batch.and_then(|b| b.take()) {
         crate::aq::aq_push_gated(
