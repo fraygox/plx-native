@@ -3,77 +3,98 @@
 //! TrueHD, FLAC, ALAC, LPCM — `devcaps::APP_DECODED`) runs on its own thread instead of
 //! serialized with container parsing and the network read that feeds it.
 //!
-//! **What moves, and what does not.** Only the decode CALL — the CPU-bound part — runs on the
-//! worker. `ff.rs`'s demux loop keeps every byte of its existing audio-push logic exactly where
-//! it is: `AuBatcher` batching, `audio_push_gate`'s cross-lane headroom check, `drain_wire`
-//! backpressure, and a decode failure's exact fatal-break semantics. The worker is handed an
-//! owned, independently ref-counted `AVPacket` (`av_packet_clone` — the demuxer's own `pkt` is
-//! reused by the next `av_read_frame` the instant this call returns, so the worker cannot borrow
-//! it) and hands back an owned `Vec<u8>`; the demux thread copies that into the SAME `AuBatcher`
-//! and pushes it through the SAME `aq_push_gated` call it always has.
+//! **What moves, and what does not.** Only the decode CALL runs on the worker. `ff.rs`'s demux
+//! loop keeps the rest of its audio-push logic where it was: `AuBatcher` batching,
+//! `audio_push_gate`'s cross-lane headroom check, `drain_wire` backpressure, and a decode
+//! failure's fatal break. The worker makes no pushes. It is handed a [`ClonedPacket`] (an
+//! `av_packet_clone`: the demuxer's own `pkt` is reused by the next `av_read_frame` as soon as the
+//! arm returns, so the worker cannot borrow it) and hands back an owned `Vec<u8>`, which the demux
+//! thread puts through the same `AuBatcher` and the same `aq_push_gated` call as before.
 //!
-//! **Why depth exactly one.** `submit` is a `sync_channel(1)`: a second submit before the first
-//! result is collected blocks the caller. That is deliberate rather than a missing buffer — a
-//! deeper queue would let the demux thread race arbitrarily far ahead of decode, and on a
-//! `pcm_lossy` stream `PcmDecoder`'s own `ErrorBudget` (consecutive-failure counter) assumes
-//! calls are answered in the order they were made; one in flight at a time keeps that invariant
-//! true with no reordering possible. The caller is expected to `try_collect` a PREVIOUS packet's
-//! result before (or instead of) submitting a new one — see `ff.rs`'s audio arm, which collects
-//! on every audio packet and only submits when nothing was collected.
+//! **One decode in flight, by construction.** The demux thread's only way to hand the worker a
+//! packet is [`PcmPipeline::exchange`]: it first collects the decode already in flight (waiting
+//! for it if the worker is still running it), and only then submits the new packet. So at most
+//! one decode is ever outstanding, results come back in the order the packets were read (which
+//! `PcmDecoder`'s `ErrorBudget`, a consecutive-failure counter, relies on), and no call sequence
+//! can queue a second one behind the first. Decode N overlaps everything the demux thread does
+//! until the next audio packet arrives: on an interleaved file, mostly video.
 //!
-//! **Seeking and teardown never race the worker.** [`PcmPipeline::reset`] first drains any
-//! outstanding submission with a BLOCKING collect (discarding its result — it is pre-seek audio),
-//! then resets the decoder on the worker thread, and only returns once that has happened. The
-//! demux thread cannot observe a stale in-flight result after a seek, and the worker never touches
-//! the decoder concurrently with itself. [`PcmPipeline::drain_final`] does the same blocking
-//! collect at EOF/teardown so the last submitted packet's audio is not silently dropped.
+//! The price is a lag of one audio packet: the audio `exchange` returns belongs to the PREVIOUS
+//! audio packet, and nothing comes back on the first one after the open or a seek.
+//! [`PcmPipeline::next_feed_pts`] names, before the call, the packet whose audio it will return,
+//! so the demux thread's bookkeeping (`first_audio_pts`, the pre-audio headroom, the audio tail)
+//! records the audio that actually reached the lane.
 //!
-//! **What this deliberately does NOT try to fix:** a genuinely stalled connection while the
-//! audio lane is parked waiting for queue space no longer gets `ff.rs`'s `drain_wire`
-//! keep-the-socket-warm polling for pushes the worker makes on the demux thread's behalf — those
-//! pushes pass a plain parking gate. That is `aq_push_gated`'s ordinary behaviour; it only matters
-//! on a lane that is already both full and parked, which an audio lane sized against its own
-//! bitrate reaches rarely. See `docs/` for the full writeup — `aq_push_gated` is used for the
-//! batched AU exactly where the original inline call was.
+//! **Seeking and teardown.** [`PcmPipeline::reset`] collects and discards the decode in flight
+//! (pre-seek audio), resets the decoder on the worker, and returns once that has happened, so the
+//! first `exchange` after a seek starts with nothing outstanding. [`PcmPipeline::drain_final`]
+//! collects the last decode at EOF, so the stream's last audio packet is not dropped. Dropping the
+//! pipeline closes the request channel and joins the worker through `plx_base::task::join`.
+//!
+//! **A refused worker is not a failed stream.** The worker starts through
+//! `plx_base::task::spawn`; if the OS refuses the thread, the pipeline keeps the decoder and
+//! decodes on the demux thread inside `exchange`, as the demuxer did before this module existed
+//! (with no lag: `exchange` then returns the packet's own audio).
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use crate::ff::AVPacket;
+use crate::player::threads::SendPtr;
 
-/// `*mut AVPacket` is not `Send`; this crate already carries the identical justification for the
-/// same pattern (`player::threads::SendPtr`) — the pointer is an owned, exclusively-held `AVPacket`
-/// for the one channel send that moves it to the worker, which is the only thread that ever reads
-/// it again.
-struct OwnedPacket(*mut AVPacket);
-unsafe impl Send for OwnedPacket {}
+/// The worker's thread name (`plx_base::task` keeps 15 bytes of it; this fits).
+const WORKER: &str = "pcm-decode";
 
-/// What the worker thread needs from a decoder. Generic so the pipeline's threading and
-/// backpressure are host-testable with a fake — [`PcmDecoderAdapter`] is the only production
-/// implementor, and it is the only place this module touches real FFmpeg.
-trait PacketDecoder: Send {
-    /// Decode one packet. Implementations that take ownership of `pkt` (the production adapter
-    /// does, via `av_packet_free`) must free it before returning; a test fake that never actually
-    /// dereferences the pointer has nothing to free.
-    fn decode(&mut self, pkt: *mut AVPacket, pts: i64) -> Result<(i64, Vec<u8>), String>;
+/// What the pipeline reports once the worker has died (a panic in the decoder) or never took the
+/// decoder.
+const GONE: &str = "the pcm-decode worker is gone";
+
+/// What the worker needs from a decoder. Generic so the pipeline's threading is host-testable
+/// with a fake; [`PcmDecoderAdapter`] is the only production implementor and the only place this
+/// module calls into the decoder.
+pub(crate) trait PacketDecoder: Send + 'static {
+    /// The packet `decode` consumes. Dropping one that was never decoded releases it.
+    type Packet: Send + 'static;
+
+    /// Decode one packet into `(pts, pcm)`.
+    fn decode(&mut self, pkt: Self::Packet, pts: i64) -> Result<(i64, Vec<u8>), String>;
 
     /// The demuxer sought: drop whatever the decoder carries from before it.
     fn reset(&mut self);
 }
 
-/// The only production [`PacketDecoder`]: owns the real decoder and the one packet-freeing step
-/// a cloned `AVPacket` needs once decode has read it.
-struct PcmDecoderAdapter(crate::ff_pcm::PcmDecoder);
+/// An `av_packet_clone` of a demuxed packet: its own reference to the payload, released
+/// (`av_packet_free`) when it drops, on whichever thread that is.
+pub(crate) struct ClonedPacket(SendPtr<AVPacket>);
+
+impl ClonedPacket {
+    /// Clone `pkt`; `None` when FFmpeg could not allocate the copy.
+    ///
+    /// # Safety
+    /// `pkt` is a valid packet.
+    pub(crate) unsafe fn of(pkt: *const AVPacket) -> Option<ClonedPacket> {
+        let clone = crate::ff::av_packet_clone(pkt);
+        (!clone.is_null()).then(|| ClonedPacket(SendPtr(clone)))
+    }
+}
+
+impl Drop for ClonedPacket {
+    fn drop(&mut self) {
+        // Safety: the pointer is this value's own `av_packet_clone`, referenced by nothing else.
+        unsafe { crate::ff::av_packet_free(&mut self.0 .0) };
+    }
+}
+
+/// The production [`PacketDecoder`]: the real decoder, fed cloned packets.
+pub(crate) struct PcmDecoderAdapter(crate::ff_pcm::PcmDecoder);
 
 impl PacketDecoder for PcmDecoderAdapter {
-    fn decode(&mut self, mut pkt: *mut AVPacket, pts: i64) -> Result<(i64, Vec<u8>), String> {
-        // Safety: `pkt` is this call's own clone (`av_packet_clone` at the submit site), held
-        // live by nothing else — freeing it here, win or lose, is exactly the ownership
-        // `av_packet_clone` handed over.
-        let result = unsafe { self.0.decode(pkt as *const AVPacket, pts) }
-            .map(|(stamp, pcm)| (stamp, pcm.to_vec()));
-        unsafe { crate::ff::av_packet_free(&mut pkt) };
-        result
+    type Packet = ClonedPacket;
+
+    fn decode(&mut self, pkt: ClonedPacket, pts: i64) -> Result<(i64, Vec<u8>), String> {
+        // Safety: `pkt` holds its own reference to the packet until it drops at the end of this
+        // call, after the decoder has read it.
+        unsafe { self.0.decode(pkt.0 .0, pts) }.map(|(stamp, pcm)| (stamp, pcm.to_vec()))
     }
 
     fn reset(&mut self) {
@@ -81,8 +102,18 @@ impl PacketDecoder for PcmDecoderAdapter {
     }
 }
 
-enum Request {
-    Decode(OwnedPacket, i64),
+/// One packet's decoded audio, as [`PcmPipeline::exchange`] hands it back.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Decoded {
+    /// The pts the packet was handed over with: the demuxed packet this audio belongs to.
+    pub packet_pts: i64,
+    /// The decoder's own stamp for the audio, which goes to the `AuBatcher`.
+    pub pcm_pts: i64,
+    pub pcm: Vec<u8>,
+}
+
+enum Request<P> {
+    Decode(P, i64),
     Reset,
 }
 
@@ -91,150 +122,186 @@ enum Response {
     Reset,
 }
 
-/// A decode in flight: [`PcmPipeline::submit`] leaves this for [`PcmPipeline::try_collect`] or a
-/// blocking drain to answer. [`PcmPipeline::reset`] has no equivalent of its own — it sends its
-/// `Request::Reset` and blocks on the one response inline, so nothing is ever left outstanding
-/// across a call boundary for a reset the way a decode's answer is.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-enum Outstanding {
-    None,
-    Decode,
-}
-
-/// The demux-thread handle onto the worker. One per engine run — a fresh `PcmPipeline` on a
-/// fresh open or a reload, exactly like `PcmDecoder` was constructed fresh before this existed.
-pub struct PcmPipeline {
-    req_tx: mpsc::SyncSender<Request>,
+/// The demux thread's side of a running worker.
+struct Worker<P> {
+    /// `None` only inside `drop`, which closes it to end the worker's loop.
+    req_tx: Option<mpsc::SyncSender<Request<P>>>,
     resp_rx: mpsc::Receiver<Response>,
     handle: Option<JoinHandle<()>>,
-    outstanding: Outstanding,
+    /// The pts of the one decode in flight, if any.
+    in_flight: Option<i64>,
+}
+
+impl<P> Worker<P> {
+    /// Wait for the decode in flight, if there is one.
+    fn collect(&mut self) -> Result<Option<Decoded>, String> {
+        let Some(packet_pts) = self.in_flight.take() else {
+            return Ok(None);
+        };
+        match self.resp_rx.recv() {
+            Ok(Response::Decoded(r)) => r.map(|(pcm_pts, pcm)| Some(Decoded { packet_pts, pcm_pts, pcm })),
+            Ok(Response::Reset) => unreachable!("a Decode request answers Decoded, never Reset"),
+            Err(_) => Err(GONE.to_owned()),
+        }
+    }
+
+    /// Hand the worker a packet. Only called with nothing in flight (`exchange` collects first),
+    /// so the one-slot channel is empty and the send never waits.
+    fn submit(&mut self, pkt: P, pts: i64) -> Result<(), String> {
+        debug_assert!(self.in_flight.is_none(), "submit with a decode still in flight");
+        let sent = self.req_tx.as_ref().is_some_and(|tx| tx.send(Request::Decode(pkt, pts)).is_ok());
+        if !sent {
+            return Err(GONE.to_owned());
+        }
+        self.in_flight = Some(pts);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        // Pre-seek audio, or a dead worker's error: either way nothing the caller wants.
+        let _ = self.collect();
+        if !self.req_tx.as_ref().is_some_and(|tx| tx.send(Request::Reset).is_ok()) {
+            return; // the worker is gone; the next `exchange` reports it
+        }
+        match self.resp_rx.recv() {
+            Ok(Response::Reset) | Err(_) => {}
+            Ok(Response::Decoded(_)) => unreachable!("a Reset request answers Reset, never Decoded"),
+        }
+    }
+}
+
+impl<P> Drop for Worker<P> {
+    fn drop(&mut self) {
+        // Closing the request channel ends the worker's `recv` loop (after any decode it is in);
+        // `task::join` logs a worker that panicked and a join that stalls.
+        self.req_tx = None;
+        if let Some(handle) = self.handle.take() {
+            plx_base::task::join(WORKER, handle);
+        }
+    }
+}
+
+enum Mode<D: PacketDecoder> {
+    Worker(Worker<D::Packet>),
+    /// The worker could not start: decode on the caller's thread.
+    Inline(D),
+}
+
+/// The demux thread's handle onto the decoder. One per demux open, like the `PcmDecoder` it owns.
+pub(crate) struct PcmPipeline<D: PacketDecoder = PcmDecoderAdapter> {
+    mode: Mode<D>,
 }
 
 impl PcmPipeline {
-    /// Spawn the worker, moving `decoder` onto it. From this call on, the decoder's thread is
-    /// fixed for the pipeline's lifetime — `PcmDecoder`'s internal state (the error budget, the
-    /// converter's filter tail) is exactly as single-threaded as it always was, just on a
-    /// different single thread.
-    pub fn spawn(decoder: crate::ff_pcm::PcmDecoder) -> PcmPipeline {
-        Self::spawn_with(PcmDecoderAdapter(decoder))
+    /// Start the worker and move `decoder` onto it, or keep the decoder here if the OS refuses
+    /// the thread.
+    pub(crate) fn start(decoder: crate::ff_pcm::PcmDecoder) -> PcmPipeline {
+        PcmPipeline::start_with(PcmDecoderAdapter(decoder), |what, work| plx_base::task::spawn(what, work))
     }
+}
 
-    fn spawn_with(decoder: impl PacketDecoder + 'static) -> PcmPipeline {
-        let (req_tx, req_rx) = mpsc::sync_channel::<Request>(1);
+impl<D: PacketDecoder> PcmPipeline<D> {
+    /// [`start`](PcmPipeline::start) with the spawn seam as a parameter, so a test can refuse it.
+    fn start_with(
+        decoder: D,
+        spawn: impl FnOnce(&'static str, Box<dyn FnOnce() + Send>) -> Option<JoinHandle<()>>,
+    ) -> Self {
+        // The decoder follows the thread rather than riding in its closure, so a refused spawn
+        // (which drops the closure unrun) leaves it here for the inline fallback.
+        let (dec_tx, dec_rx) = mpsc::sync_channel::<D>(1);
+        let (req_tx, req_rx) = mpsc::sync_channel::<Request<D::Packet>>(1);
         let (resp_tx, resp_rx) = mpsc::channel::<Response>();
-        let handle = std::thread::Builder::new()
-            .name("pcm-decode".into())
-            .spawn(move || Self::run(decoder, req_rx, resp_tx))
-            .ok();
-        PcmPipeline {
-            req_tx,
-            resp_rx,
-            handle,
-            outstanding: Outstanding::None,
-        }
-    }
-
-    fn run(mut decoder: impl PacketDecoder, req_rx: mpsc::Receiver<Request>, resp_tx: mpsc::Sender<Response>) {
-        while let Ok(req) = req_rx.recv() {
-            let resp = match req {
-                Request::Decode(OwnedPacket(pkt), pts) => Response::Decoded(decoder.decode(pkt, pts)),
-                Request::Reset => {
-                    decoder.reset();
-                    Response::Reset
+        let handle = spawn(
+            WORKER,
+            Box::new(move || {
+                if let Ok(decoder) = dec_rx.recv() {
+                    run(decoder, req_rx, resp_tx);
                 }
-            };
-            if resp_tx.send(resp).is_err() {
-                // The pipeline was dropped mid-call (teardown raced the worker, not the thread
-                // spawn): nothing left to answer, and nothing left to decode for.
-                return;
+            }),
+        );
+        let inline = |decoder: D| {
+            crate::player::log("ff: pcm-decode worker refused; decoding PCM on the demux thread");
+            PcmPipeline { mode: Mode::Inline(decoder) }
+        };
+        let Some(handle) = handle else {
+            return inline(decoder);
+        };
+        // The worker waits for the decoder; the one-slot channel takes it without blocking.
+        match dec_tx.send(decoder) {
+            Ok(()) => PcmPipeline {
+                mode: Mode::Worker(Worker { req_tx: Some(req_tx), resp_rx, handle: Some(handle), in_flight: None }),
+            },
+            Err(mpsc::SendError(decoder)) => {
+                plx_base::task::join(WORKER, handle);
+                inline(decoder)
             }
         }
     }
 
-    /// Submit a packet for decode and return immediately — never calls into FFmpeg on this
-    /// thread. `false` means the worker is gone (it never panics in normal operation; a crashed
-    /// worker is a bug, not a condition this type recovers from) — the caller treats it exactly
-    /// like `PcmDecoder::decode` returning `Err` used to: a fatal demux failure.
-    ///
-    /// Caller contract: at most one submission outstanding. Collect (or drain) the previous one
-    /// first; `sync_channel(1)` makes a violation block rather than silently reorder, which would
-    /// turn into a deadlock the first time it happened in testing rather than a quiet corruption
-    /// later — the louder failure is the one worth having here.
-    pub fn submit(&mut self, pkt: *mut AVPacket, pts: i64) -> bool {
-        debug_assert_eq!(self.outstanding, Outstanding::None, "a submit raced an uncollected one");
-        let ok = self.req_tx.send(Request::Decode(OwnedPacket(pkt), pts)).is_ok();
-        if ok {
-            self.outstanding = Outstanding::Decode;
-        }
-        ok
+    /// Whether decode runs on the worker (`false`: the worker was refused, decode is inline).
+    pub(crate) fn off_thread(&self) -> bool {
+        matches!(self.mode, Mode::Worker(_))
     }
 
-    /// Collect a previously submitted decode if the worker has finished it; `None` means either
-    /// nothing is outstanding or the worker has not finished yet — the two look the same to the
-    /// caller, which already treats "no AU yet" as business as usual on every other packet.
-    pub fn try_collect(&mut self) -> Option<Result<(i64, Vec<u8>), String>> {
-        if self.outstanding != Outstanding::Decode {
-            return None;
+    /// The `packet_pts` of the audio an [`exchange`](Self::exchange) of a packet at `pts` would
+    /// return: the decode in flight on the worker (`None` when nothing is), or `pts` itself
+    /// inline.
+    pub(crate) fn next_feed_pts(&self, pts: i64) -> Option<i64> {
+        match &self.mode {
+            Mode::Worker(w) => w.in_flight,
+            Mode::Inline(_) => Some(pts),
         }
-        match self.resp_rx.try_recv() {
-            Ok(Response::Decoded(r)) => {
-                self.outstanding = Outstanding::None;
-                Some(r)
+    }
+
+    /// Hand over the packet at `pts` and get back the previous packet's audio: the decode in
+    /// flight is collected first (waiting for the worker if it is still decoding), then `pkt` is
+    /// submitted. `Ok(None)` when nothing was in flight. `Err` is a decode failure of the
+    /// collected packet (`pkt` is then not submitted) or a dead worker; the caller treats both as
+    /// it treated `PcmDecoder::decode`'s `Err`: fatal to the demux.
+    pub(crate) fn exchange(&mut self, pkt: D::Packet, pts: i64) -> Result<Option<Decoded>, String> {
+        match &mut self.mode {
+            Mode::Worker(w) => {
+                let previous = w.collect()?;
+                w.submit(pkt, pts)?;
+                Ok(previous)
             }
-            Ok(Response::Reset) => unreachable!("a Decode request answers Decoded, never Reset"),
-            Err(_) => None,
+            Mode::Inline(d) => d
+                .decode(pkt, pts)
+                .map(|(pcm_pts, pcm)| Some(Decoded { packet_pts: pts, pcm_pts, pcm })),
         }
     }
 
-    /// Block for a submission already in flight, discarding its result. Used only before a
-    /// `reset` (the result is pre-seek audio, which the caller is about to throw away regardless)
-    /// and at teardown through [`drain_final`](Self::drain_final), which wants the AU instead.
-    fn collect_blocking(&mut self) -> Option<Result<(i64, Vec<u8>), String>> {
-        if self.outstanding != Outstanding::Decode {
-            return None;
-        }
-        self.outstanding = Outstanding::None;
-        match self.resp_rx.recv() {
-            Ok(Response::Decoded(r)) => Some(r),
-            Ok(Response::Reset) => unreachable!("a Decode request answers Decoded, never Reset"),
-            Err(_) => None,
+    /// At EOF: the last submitted packet's audio, waiting for the worker if it is still decoding
+    /// it. `Ok(None)` when nothing is in flight.
+    pub(crate) fn drain_final(&mut self) -> Result<Option<Decoded>, String> {
+        match &mut self.mode {
+            Mode::Worker(w) => w.collect(),
+            Mode::Inline(_) => Ok(None),
         }
     }
 
-    /// The last submitted packet's audio, blocking until the worker has it — called once, at
-    /// EOF/teardown, before the caller's final `AuBatcher::take()` flush. Skipping this would
-    /// silently drop up to one packet's worth of audio from the very end of every stream this
-    /// pipeline ever decoded.
-    pub fn drain_final(&mut self) -> Option<Result<(i64, Vec<u8>), String>> {
-        self.collect_blocking()
-    }
-
-    /// A seek: drop whatever the worker carries from the old position (in flight or already
-    /// decoded-but-uncollected — either way it is pre-seek audio) and reset the decoder, blocking
-    /// until the reset has actually happened on the worker thread. Returns only once it is safe
-    /// for the demux thread to resume feeding packets at the new position — no result can arrive
-    /// out of order, because nothing is ever outstanding across this call.
-    pub fn reset(&mut self) {
-        let _ = self.collect_blocking();
-        if self.req_tx.send(Request::Reset).is_err() {
-            return;
-        }
-        match self.resp_rx.recv() {
-            Ok(Response::Reset) => {}
-            Ok(Response::Decoded(_)) => unreachable!("a Reset request answers Reset, never Decoded"),
-            Err(_) => {}
+    /// A seek: discard the decode in flight (pre-seek audio) and reset the decoder, returning once
+    /// the reset has happened.
+    pub(crate) fn reset(&mut self) {
+        match &mut self.mode {
+            Mode::Worker(w) => w.reset(),
+            Mode::Inline(d) => d.reset(),
         }
     }
 }
 
-impl Drop for PcmPipeline {
-    fn drop(&mut self) {
-        // Dropping `req_tx` ends the worker's `recv()` loop; join so a torn-down engine never
-        // leaves a `pcm-decode` thread outliving it (the same shape `engine::teardown` already
-        // keeps for every other worker — see `player/CLAUDE.md`'s threading model).
-        drop(std::mem::replace(&mut self.req_tx, mpsc::sync_channel(1).0));
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+/// The worker's loop: answer each request in order until the request channel closes.
+fn run<D: PacketDecoder>(mut decoder: D, req_rx: mpsc::Receiver<Request<D::Packet>>, resp_tx: mpsc::Sender<Response>) {
+    while let Ok(req) = req_rx.recv() {
+        let resp = match req {
+            Request::Decode(pkt, pts) => Response::Decoded(decoder.decode(pkt, pts)),
+            Request::Reset => {
+                decoder.reset();
+                Response::Reset
+            }
+        };
+        if resp_tx.send(resp).is_err() {
+            return; // the pipeline is gone: nobody left to answer
         }
     }
 }
@@ -243,28 +310,38 @@ impl Drop for PcmPipeline {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
-    /// A fake decoder for the pipeline's own tests: never dereferences `pkt` (tests pass
-    /// `std::ptr::null_mut()`), so these run with no FFmpeg and no real `AVPacket` anywhere.
+    /// A decoder with no FFmpeg behind it: the packet at `pts` decodes to `(pts, [pts as u8])`,
+    /// unless the test says that pts fails or panics.
+    #[derive(Default)]
     struct FakeDecoder {
-        /// `decode`'s answer, consumed in order; a call past the end panics the test loudly.
-        script: std::collections::VecDeque<Result<(i64, Vec<u8>), String>>,
         resets: Arc<AtomicUsize>,
-        /// Lets a test block the worker inside `decode` until the test releases it, so a
-        /// `try_collect` while decode is still "running" is observable as `None` rather than a
-        /// race that usually finishes first.
-        hold: Option<std::sync::mpsc::Receiver<()>>,
+        /// The pts of every `decode` call, in call order.
+        calls: Arc<Mutex<Vec<i64>>>,
+        /// When set, each `decode` waits for one message first, so the test decides when the
+        /// worker finishes.
+        hold: Option<mpsc::Receiver<()>>,
+        fail_at: Option<i64>,
+        panic_at: Option<i64>,
     }
 
     impl PacketDecoder for FakeDecoder {
-        fn decode(&mut self, _pkt: *mut AVPacket, _pts: i64) -> Result<(i64, Vec<u8>), String> {
+        type Packet = ();
+
+        fn decode(&mut self, (): (), pts: i64) -> Result<(i64, Vec<u8>), String> {
             if let Some(hold) = &self.hold {
                 let _ = hold.recv();
             }
-            self.script
-                .pop_front()
-                .expect("the test's script has no answer for this call")
+            self.calls.lock().unwrap().push(pts);
+            if self.panic_at == Some(pts) {
+                panic!("the fake decoder panics at {pts}, as the test asked");
+            }
+            if self.fail_at == Some(pts) {
+                return Err(format!("bad packet {pts}"));
+            }
+            Ok((pts, vec![pts as u8]))
         }
 
         fn reset(&mut self) {
@@ -272,114 +349,133 @@ mod tests {
         }
     }
 
-    fn spawn_fake(
-        script: Vec<Result<(i64, Vec<u8>), String>>,
-    ) -> (PcmPipeline, Arc<AtomicUsize>) {
-        let resets = Arc::new(AtomicUsize::new(0));
-        let pipeline = PcmPipeline::spawn_with(FakeDecoder {
-            script: script.into(),
-            resets: Arc::clone(&resets),
-            hold: None,
+    fn decoded(pts: i64) -> Decoded {
+        Decoded { packet_pts: pts, pcm_pts: pts, pcm: vec![pts as u8] }
+    }
+
+    fn start(fake: FakeDecoder) -> PcmPipeline<FakeDecoder> {
+        let p = PcmPipeline::start_with(fake, |what, work| plx_base::task::spawn(what, work));
+        assert!(p.off_thread(), "the worker must have started for this test to mean anything");
+        p
+    }
+
+    /// Regression: the demux arm used to `try_collect`, get `None` while the worker was still
+    /// decoding, and submit the next packet anyway: two decodes outstanding, and a seek's `reset`
+    /// then met a stale `Decoded` (`unreachable!`). `exchange` is the only way in now, and a
+    /// packet that arrives while the previous one is still decoding waits for it instead of
+    /// queueing behind it.
+    #[test]
+    fn an_exchange_while_the_worker_is_still_decoding_waits_for_it_and_a_reset_after_is_clean() {
+        let (release, hold) = mpsc::channel();
+        let fake = FakeDecoder { hold: Some(hold), ..FakeDecoder::default() };
+        let resets = Arc::clone(&fake.resets);
+        let mut p = start(fake);
+        assert_eq!(p.exchange((), 1), Ok(None));
+        assert_eq!(p.next_feed_pts(2), Some(1));
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            release.send(()).unwrap(); // decode 1 finishes
+            release.send(()).unwrap(); // decode 2 (the reset discards it)
+            release.send(()).unwrap(); // decode 3
         });
-        (pipeline, resets)
-    }
-
-    #[test]
-    fn a_submitted_packet_is_collectible_once_the_worker_answers() {
-        let (mut p, _resets) = spawn_fake(vec![Ok((42, vec![1, 2, 3]))]);
-        p.submit(std::ptr::null_mut(), 42);
-        let got = loop {
-            if let Some(r) = p.try_collect() {
-                break r;
-            }
-        };
-        assert_eq!(got, Ok((42, vec![1, 2, 3])));
-    }
-
-    #[test]
-    fn try_collect_answers_none_before_the_worker_has_finished_and_again_once_nothing_is_outstanding() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let resets = Arc::new(AtomicUsize::new(0));
-        let mut p = PcmPipeline::spawn_with(FakeDecoder {
-            script: vec![Ok((1, vec![9]))].into(),
-            resets: Arc::clone(&resets),
-            hold: Some(rx),
-        });
-        p.submit(std::ptr::null_mut(), 1);
-        // The worker is parked in `decode`, waiting on `hold` — nothing to collect yet, and that
-        // must read as "nothing yet", not as an error or a panic.
-        assert_eq!(p.try_collect(), None);
-        assert_eq!(p.try_collect(), None, "collecting nothing twice is still nothing");
-        tx.send(()).unwrap();
-        let got = loop {
-            if let Some(r) = p.try_collect() {
-                break r;
-            }
-        };
-        assert_eq!(got, Ok((1, vec![9])));
-        // Nothing is outstanding anymore — the SAME non-blocking answer, for the other reason.
-        assert_eq!(p.try_collect(), None);
-    }
-
-    #[test]
-    fn a_decode_error_is_handed_back_exactly_once() {
-        let (mut p, _resets) = spawn_fake(vec![Err("avcodec_send_packet failed (-22)".into())]);
-        p.submit(std::ptr::null_mut(), 7);
-        let got = loop {
-            if let Some(r) = p.try_collect() {
-                break r;
-            }
-        };
-        assert_eq!(got, Err("avcodec_send_packet failed (-22)".into()));
-    }
-
-    #[test]
-    fn reset_drains_an_outstanding_submission_before_resetting_the_decoder() {
-        let (mut p, resets) = spawn_fake(vec![Ok((1, vec![1])), Ok((99, vec![9]))]);
-        p.submit(std::ptr::null_mut(), 1);
-        // Pre-seek audio in flight, never collected — reset must wait for and discard it, not
-        // leave it to surface after the decoder has already been reset for the new position.
+        let t0 = Instant::now();
+        assert_eq!(p.exchange((), 2), Ok(Some(decoded(1))));
+        assert!(t0.elapsed() >= Duration::from_millis(40), "the second exchange must wait for decode 1");
         p.reset();
         assert_eq!(resets.load(Ordering::SeqCst), 1);
-        assert_eq!(p.try_collect(), None, "the drained result must not still be collectible");
-        // The worker is healthy afterwards: a fresh submit still answers.
-        p.submit(std::ptr::null_mut(), 99);
-        let got = loop {
-            if let Some(r) = p.try_collect() {
-                break r;
-            }
-        };
-        assert_eq!(got, Ok((99, vec![9])));
+        assert_eq!(p.next_feed_pts(3), None, "nothing is in flight after a seek");
+        assert_eq!(p.exchange((), 3), Ok(None));
+        assert_eq!(p.drain_final(), Ok(Some(decoded(3))));
+        releaser.join().unwrap();
     }
 
     #[test]
-    fn reset_with_nothing_outstanding_still_resets_the_decoder() {
-        let (mut p, resets) = spawn_fake(vec![]);
+    fn each_exchange_returns_the_previous_packets_audio_and_drain_final_the_last() {
+        let fake = FakeDecoder::default();
+        let calls = Arc::clone(&fake.calls);
+        let mut p = start(fake);
+        assert_eq!(p.drain_final(), Ok(None), "nothing in flight yet");
+        assert_eq!(p.exchange((), 10), Ok(None));
+        assert_eq!(p.exchange((), 20), Ok(Some(decoded(10))));
+        assert_eq!(p.exchange((), 30), Ok(Some(decoded(20))));
+        assert_eq!(p.next_feed_pts(40), Some(30));
+        assert_eq!(p.drain_final(), Ok(Some(decoded(30))));
+        assert_eq!(p.drain_final(), Ok(None), "the last decode is handed back once");
+        assert_eq!(*calls.lock().unwrap(), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn a_reset_after_several_exchanges_discards_only_the_decode_in_flight() {
+        let fake = FakeDecoder::default();
+        let resets = Arc::clone(&fake.resets);
+        let calls = Arc::clone(&fake.calls);
+        let mut p = start(fake);
+        assert_eq!(p.exchange((), 1), Ok(None));
+        for pts in 2..=5 {
+            assert_eq!(p.exchange((), pts), Ok(Some(decoded(pts - 1))));
+        }
+        p.reset();
+        p.reset();
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
+        assert_eq!(p.exchange((), 100), Ok(None), "packet 5 was pre-seek audio");
+        assert_eq!(p.exchange((), 101), Ok(Some(decoded(100))));
+        assert_eq!(*calls.lock().unwrap(), vec![1, 2, 3, 4, 5, 100, 101]);
+    }
+
+    #[test]
+    fn a_decode_error_comes_back_on_the_next_exchange_which_then_submits_nothing() {
+        let fake = FakeDecoder { fail_at: Some(1), ..FakeDecoder::default() };
+        let calls = Arc::clone(&fake.calls);
+        let mut p = start(fake);
+        assert_eq!(p.exchange((), 1), Ok(None));
+        assert_eq!(p.exchange((), 2), Err("bad packet 1".to_owned()));
+        assert_eq!(p.drain_final(), Ok(None), "packet 2 was never submitted");
+        assert_eq!(*calls.lock().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn the_last_packets_decode_error_comes_back_from_drain_final() {
+        let mut p = start(FakeDecoder { fail_at: Some(2), ..FakeDecoder::default() });
+        assert_eq!(p.exchange((), 1), Ok(None));
+        assert_eq!(p.exchange((), 2), Ok(Some(decoded(1))));
+        assert_eq!(p.drain_final(), Err("bad packet 2".to_owned()));
+    }
+
+    /// A worker that died (here the decoder panicked) is a failure on every later call, never a
+    /// hang; a reset on it returns, and dropping the pipeline still joins.
+    #[test]
+    fn a_dead_worker_fails_every_exchange_instead_of_hanging() {
+        let mut p = start(FakeDecoder { panic_at: Some(1), ..FakeDecoder::default() });
+        assert_eq!(p.exchange((), 1), Ok(None));
+        assert_eq!(p.exchange((), 2), Err(GONE.to_owned()));
+        assert_eq!(p.exchange((), 3), Err(GONE.to_owned()));
+        p.reset();
+        assert_eq!(p.drain_final(), Ok(None));
+        drop(p);
+    }
+
+    /// The OS refused the thread: the decoder stays on the caller's thread and each packet is
+    /// decoded inside its own `exchange`, with no lag.
+    #[test]
+    fn a_refused_worker_decodes_inline_on_the_callers_thread() {
+        let fake = FakeDecoder::default();
+        let resets = Arc::clone(&fake.resets);
+        let mut p = PcmPipeline::start_with(fake, |_, _| None);
+        assert!(!p.off_thread());
+        assert_eq!(p.next_feed_pts(7), Some(7));
+        assert_eq!(p.exchange((), 7), Ok(Some(decoded(7))));
+        assert_eq!(p.exchange((), 8), Ok(Some(decoded(8))));
+        assert_eq!(p.drain_final(), Ok(None));
         p.reset();
         assert_eq!(resets.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn drain_final_returns_the_last_submission_instead_of_dropping_it() {
-        let (mut p, _resets) = spawn_fake(vec![Ok((5, vec![7, 7, 7]))]);
-        p.submit(std::ptr::null_mut(), 5);
-        assert_eq!(p.drain_final(), Some(Ok((5, vec![7, 7, 7]))));
-        // Already collected: a second drain at a later EOF-ish call site must not block forever
-        // or hand back a stale answer.
-        assert_eq!(p.drain_final(), None);
-    }
-
-    #[test]
-    fn drain_final_with_nothing_outstanding_answers_none_at_once() {
-        let (mut p, _resets) = spawn_fake(vec![]);
-        assert_eq!(p.drain_final(), None);
-    }
-
-    #[test]
-    fn dropping_the_pipeline_joins_the_worker_rather_than_leaking_it() {
-        let (p, _resets) = spawn_fake(vec![]);
-        let handle_is_some = p.handle.is_some();
-        assert!(handle_is_some, "the worker must have spawned for this test to mean anything");
-        drop(p); // must return — a hang here is the bug this test exists to catch
+    fn dropping_the_pipeline_with_a_decode_in_flight_joins_the_worker() {
+        let (release, hold) = mpsc::channel();
+        let mut p = start(FakeDecoder { hold: Some(hold), ..FakeDecoder::default() });
+        assert_eq!(p.exchange((), 1), Ok(None));
+        release.send(()).unwrap();
+        drop(p); // must return: a hang here is the leak this test exists to catch
     }
 }
