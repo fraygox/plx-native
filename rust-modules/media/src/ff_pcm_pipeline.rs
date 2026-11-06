@@ -124,7 +124,7 @@ enum Response {
 
 /// The demux thread's side of a running worker.
 struct Worker<P> {
-    /// `None` only inside `drop`, which closes it to end the worker's loop.
+    /// `None` once the worker is gone, and inside `drop`, which closes it to end the worker's loop.
     req_tx: Option<mpsc::SyncSender<Request<P>>>,
     resp_rx: mpsc::Receiver<Response>,
     handle: Option<JoinHandle<()>>,
@@ -141,8 +141,16 @@ impl<P> Worker<P> {
         match self.resp_rx.recv() {
             Ok(Response::Decoded(r)) => r.map(|(pcm_pts, pcm)| Some(Decoded { packet_pts, pcm_pts, pcm })),
             Ok(Response::Reset) => unreachable!("a Decode request answers Decoded, never Reset"),
-            Err(_) => Err(GONE.to_owned()),
+            Err(_) => self.gone(),
         }
+    }
+
+    /// The worker is gone (it panicked). Close the request side too, so every later call fails
+    /// here at once: otherwise a send could still land in the channel of a worker that is
+    /// unwinding (`run`'s `resp_tx` drops before its `req_rx`) and read as a submitted decode.
+    fn gone<T>(&mut self) -> Result<T, String> {
+        self.req_tx = None;
+        Err(GONE.to_owned())
     }
 
     /// Hand the worker a packet. Only called with nothing in flight (`exchange` collects first),
@@ -151,7 +159,7 @@ impl<P> Worker<P> {
         debug_assert!(self.in_flight.is_none(), "submit with a decode still in flight");
         let sent = self.req_tx.as_ref().is_some_and(|tx| tx.send(Request::Decode(pkt, pts)).is_ok());
         if !sent {
-            return Err(GONE.to_owned());
+            return self.gone();
         }
         self.in_flight = Some(pts);
         Ok(())
@@ -161,10 +169,12 @@ impl<P> Worker<P> {
         // Pre-seek audio, or a dead worker's error: either way nothing the caller wants.
         let _ = self.collect();
         if !self.req_tx.as_ref().is_some_and(|tx| tx.send(Request::Reset).is_ok()) {
+            self.req_tx = None;
             return; // the worker is gone; the next `exchange` reports it
         }
         match self.resp_rx.recv() {
-            Ok(Response::Reset) | Err(_) => {}
+            Ok(Response::Reset) => {}
+            Err(_) => self.req_tx = None,
             Ok(Response::Decoded(_)) => unreachable!("a Reset request answers Reset, never Decoded"),
         }
     }
@@ -372,13 +382,15 @@ mod tests {
         let mut p = start(fake);
         assert_eq!(p.exchange((), 1), Ok(None));
         assert_eq!(p.next_feed_pts(2), Some(1));
+        // Taken before the releaser exists, so its 50 ms sleep is wholly inside the measured span
+        // however late the OS schedules this thread after the spawn.
+        let t0 = Instant::now();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             release.send(()).unwrap(); // decode 1 finishes
             release.send(()).unwrap(); // decode 2 (the reset discards it)
             release.send(()).unwrap(); // decode 3
         });
-        let t0 = Instant::now();
         assert_eq!(p.exchange((), 2), Ok(Some(decoded(1))));
         assert!(t0.elapsed() >= Duration::from_millis(40), "the second exchange must wait for decode 1");
         p.reset();
@@ -443,7 +455,9 @@ mod tests {
     }
 
     /// A worker that died (here the decoder panicked) is a failure on every later call, never a
-    /// hang; a reset on it returns, and dropping the pipeline still joins.
+    /// hang; a reset on it returns, and dropping the pipeline still joins. Deterministic: the
+    /// first `Err` closes the request side, so a later submit cannot race the worker's unwind
+    /// into a send that succeeds.
     #[test]
     fn a_dead_worker_fails_every_exchange_instead_of_hanging() {
         let mut p = start(FakeDecoder { panic_at: Some(1), ..FakeDecoder::default() });
