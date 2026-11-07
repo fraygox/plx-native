@@ -287,7 +287,9 @@ impl PcmConverter {
     }
 }
 
-// Owned by the one demux thread that opened it.
+// Used by one thread at a time: the demux thread opens it and moves it onto its `ff_pcm_pipeline`
+// worker, which alone calls into it from then on (or it stays on the demux thread when the OS
+// refuses that worker).
 unsafe impl Send for PcmDecoder {}
 
 impl PcmDecoder {
