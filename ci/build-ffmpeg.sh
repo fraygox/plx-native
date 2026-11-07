@@ -213,7 +213,8 @@ else
   # Cross builds only: the HOST build links with Apple's ld, which has no such flag.
   set -- --prefix=/plx \
     --enable-cross-compile --cross-prefix="$CROSS" --host-cc=cc --cc=./plx-arm-cc.py \
-    --arch=arm --cpu=cortex-a9 --target-os=linux --sysroot="$SYSROOT" \
+    --arch=arm --cpu=armv8.2-a --target-os=linux --sysroot="$SYSROOT" \
+    --extra-cflags='-mtune=cortex-a55 -mfpu=neon-fp-armv8 -mfloat-abi=softfp' \
     --extra-ldflags='-Wl,--build-id=sha1'
 fi
 set -- "$@" \
@@ -222,7 +223,7 @@ set -- "$@" \
   --extra-cflags='-Dstatic_assert=_Static_assert' \
   --disable-programs --disable-doc --disable-avdevice --disable-avfilter \
   --disable-network --disable-swresample \
-  --disable-debug --enable-small \
+  --disable-debug \
   --disable-everything \
   --disable-autodetect \
   --enable-zlib \

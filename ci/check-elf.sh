@@ -38,7 +38,7 @@ grep -q 'Class: *ELF32'      <<<"$H" || fail "not ELF32"
 grep -q 'Machine: *ARM'      <<<"$H" || fail "not ARM"
 grep -q 'Flags:.*soft-float' <<<"$H" || fail "not soft-float ABI (the NDK's softfp convention)"
 A=$("$READELF" -A "$BIN") || fail "readelf -A failed"
-grep -q 'Tag_CPU_arch: v7' <<<"$A" || fail "not ARMv7 (Tag_CPU_arch)"
+grep -qE 'Tag_CPU_arch: v(7|8)$' <<<"$A" || fail "not ARMv7/ARMv8 (Tag_CPU_arch)"  # LOCAL A55 ONE-OFF: v8 accepted
 ok "ELF32 / ARM / soft-float / ARMv7"
 
 echo "== Starfish callback interposer =="
@@ -204,7 +204,7 @@ else
   grep -q 'Machine: *ARM'      <<<"$SH" || fail "storage helper is not ARM"
   grep -q 'Flags:.*soft-float' <<<"$SH" || fail "storage helper is not the soft-float ABI (the NDK's softfp convention)"
   SA=$("$READELF" -A "$STORAGE") || fail "readelf -A failed on the storage helper"
-  grep -q 'Tag_CPU_arch: v7' <<<"$SA" || fail "storage helper is not ARMv7 (Tag_CPU_arch)"
+  grep -qE 'Tag_CPU_arch: v(7|8)$' <<<"$SA" || fail "storage helper is not ARMv7/ARMv8 (Tag_CPU_arch)"  # LOCAL A55 ONE-OFF
   SDYNAMIC=$("$READELF" -d "$STORAGE") || fail "readelf -d failed on the storage helper"
   sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' <<<"$SDYNAMIC" | LC_ALL=C sort > "$AUDIT_TMP/storage-dt-needed.actual"
   if ! diff -u ci/expected-dt-needed-storage.txt "$AUDIT_TMP/storage-dt-needed.actual"; then

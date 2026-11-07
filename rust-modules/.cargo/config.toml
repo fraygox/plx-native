@@ -74,7 +74,8 @@
 # fingerprint differently, so they rebuild over each other if pointed at the same --target-dir.
 # The Makefile's own dirs (target/, target-release/) are unaffected.
 [target.armv7-unknown-linux-gnueabi]
-rustflags = ["-C", "target-cpu=cortex-a9", "-C", "target-feature=-neon,-soft-float", "-C", "force-frame-pointers=yes"]
+# LOCAL A55 ONE-OFF (not for upstream): cortex-a55, kept in lockstep with the Makefile's RUST_CODEGEN.
+rustflags = ["-C", "target-cpu=cortex-a55", "-C", "target-feature=-neon,-soft-float", "-C", "force-frame-pointers=yes"]
 
 # No `[unstable] build-std`: the target's prebuilt std is ARMv7 (dmb, not the CP15 barrier), so the
 # ARM build runs on the STABLE toolchain pinned in rust-toolchain.toml (which lists the armv7 target,

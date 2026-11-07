@@ -295,7 +295,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # with `[profile.tvdev]` below. Release-profile builds are CI, `RELEASE=1`, `SYMBOLS=1`,
 # `FLAVOR=stable|nightly` and `make ARM_PROFILE=release`.
 [profile.release]
-opt-level = 2
+opt-level = 3  # LOCAL A55 ONE-OFF (was 2)
 lto = "fat"
 codegen-units = 1
 

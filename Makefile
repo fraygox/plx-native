@@ -281,7 +281,12 @@ WERROR      ?= -Werror
 # The out-of-process crash walker follows ARM's APCS frame chain. Keeping r11 frame pointers in
 # every C frame is therefore part of the crash-reporting ABI, not debug-only codegen; without it a
 # valid envelope contains only the faulting PC. Rust's matching flag is in RUST_ENV/config.toml.
-CFLAGS       = --sysroot=$(SYSROOT) -O2 -fno-omit-frame-pointer -funwind-tables -Wall -Wextra $(WERROR) -Isrc -Ivendor/nanosvg -D_GNU_SOURCE
+# LOCAL A55 ONE-OFF (not for upstream). -march/-mtune rather than -mcpu=cortex-a55: with GCC 12,
+# -mcpu=cortex-a55 plus any ARMv8 -mfpu also turns on dot-product and FP16 arithmetic, which the
+# webOS 5.6.2 set does not report; -march=armv8.2-a with -mfpu=neon-fp-armv8 is exactly the common
+# subset (ARMv8 VFP + NEON, no dotprod/fp16/crypto). -mfloat-abi=softfp is the NDK default, spelled out.
+ARM_CPU_FLAGS = -march=armv8.2-a -mtune=cortex-a55 -mfpu=neon-fp-armv8 -mfloat-abi=softfp
+CFLAGS       = --sysroot=$(SYSROOT) $(ARM_CPU_FLAGS) -O2 -fno-omit-frame-pointer -funwind-tables -Wall -Wextra $(WERROR) -Isrc -Ivendor/nanosvg -D_GNU_SOURCE
 # DEBUG=1 keeps DWARF in the binary so a crash PC symbolizes to file:line instead of just
 # a function name (tools/crash-report.sh / the crash-triage skill). Same codegen, bigger
 # binary — deploy it only while chasing a crash.
@@ -389,7 +394,9 @@ RUST_CAPLINTS = --cap-lints=warn
 endif
 # The codegen flags alone, so ci/check-vfp.py can compile its probe with exactly these
 # (`make -s print-rust-codegen`) and compare them with rust-modules/.cargo/config.toml.
-RUST_CODEGEN = -C target-cpu=cortex-a9 -C target-feature=-neon,-soft-float -C force-frame-pointers=yes
+# LOCAL A55 ONE-OFF (not for upstream): ARMv8.2-A codegen tuned for the Cortex-A55. Still -neon
+# (simd-adler32's NEON path needs nightly), still -soft-float, still frame pointers.
+RUST_CODEGEN = -C target-cpu=cortex-a55 -C target-feature=-neon,-soft-float -C force-frame-pointers=yes
 RUST_ENV = RUSTFLAGS="$(RUST_CODEGEN) $(RUST_DEBUGINFO) $(RUST_CAPLINTS) $(RUST_REMAP)"
 # No C translation unit includes an SDL, GLES or KHR header (the Rust layers declare their own
 # `extern` signatures and read SDL structs by raw offset), so no copy of those headers is kept
